@@ -10,7 +10,12 @@ attention op by default.
 
 ## Environment Setup
 
-Create and install the vLLM development environment from the repo root:
+Install vLLM from the repo root with either a uv virtualenv or the
+`vllm-py312` conda environment. The launch scripts prefer `../.venv` when
+present, otherwise the `vllm-py312` conda env (override with `VLLM_CONDA_ENV`),
+otherwise `python`/`torchrun` from `PATH`.
+
+uv virtualenv:
 
 ```bash
 cd /path/to/vllm
@@ -21,15 +26,59 @@ source .venv/bin/activate
 VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
 ```
 
-The one-GPU script calls `../.venv/bin/python` directly. The multi-GPU scripts
-use `torchrun`, so activate the environment first:
+Conda on V100 (this machine):
+
+PyTorch 2.11 does not ship CUDA kernels for Tesla V100 (compute capability
+7.0). Use torch 2.6+cu124 and let the runner default to the SDPA attention
+backend:
 
 ```bash
-source ../.venv/bin/activate
+cd /path/to/vllm
+
+conda create -n vllm-py312 python=3.12 -y
+conda activate vllm-py312
+
+python -m pip install --upgrade pip setuptools wheel
+pip install torch==2.6.0+cu124 torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu124
 ```
 
-On V100, keep the default `float16` dtype. On A100, the default `float16` works,
-and `--dtype bfloat16` is optional.
+No vLLM install is required for the default V100 path (`--attention-backend
+auto` selects `sdpa`). For `triton-prefill` on large packed cases such as
+`1kx128`, build vLLM from source against the same torch 2.6+cu124 stack.
+
+Conda on A100 and newer (compute capability >= 8.0):
+
+```bash
+cd /path/to/vllm
+
+conda create -n vllm-py312 python=3.12 -y
+conda activate vllm-py312
+
+python -m pip install --upgrade pip setuptools wheel
+pip install torch==2.11.0 torchaudio torchvision \
+  --index-url https://download.pytorch.org/whl/cu129
+VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 VLLM_USE_PRECOMPILED=1 \
+  python -m pip install -e .
+```
+
+The launch scripts prefer `../.venv` when present, otherwise the `vllm-py312`
+conda env (override with `VLLM_CONDA_ENV`), otherwise `python`/`torchrun`
+from `PATH`. You do not need to activate conda if `vllm-py312` exists, but
+activating it is fine:
+
+```bash
+conda activate vllm-py312
+cd single_llama_block_runner
+./run_1gpu.sh
+```
+
+Your NVIDIA driver must support the PyTorch CUDA build you install. If you
+previously installed `cu130` wheels on a driver that reports `CUDA Version:
+12.4`, use `cu124` on V100 or `cu129` on newer GPUs.
+
+On V100, keep the default `float16` dtype and expect `auto` to select `sdpa`.
+On A100, the default `float16` works, and `--dtype bfloat16` is optional.
 
 ## Cases
 
@@ -60,13 +109,14 @@ Run all launch sizes in order:
 ./run_all.sh
 ```
 
-The one-GPU script uses `../.venv/bin/python`. The multi-GPU scripts use
-`torchrun`, which should come from the active vLLM environment.
+The launch scripts resolve Python and `torchrun` automatically via `env.sh`.
 
 ## Direct Commands
 
+With the environment active:
+
 ```bash
-../.venv/bin/python run_block.py --case all --tp-size 1
+python run_block.py --case all --tp-size 1
 torchrun --nproc-per-node=4 run_block.py --case all --tp-size 4
 torchrun --nproc-per-node=8 run_block.py --case all --tp-size 8
 ```
@@ -79,9 +129,10 @@ The script detects the GPU name and compute capability at runtime.
 - A100: default `--dtype auto` resolves to `float16`.
 - A100 optional BF16: pass `--dtype bfloat16`.
 
-The default attention backend is `--attention-backend auto`, which resolves to
-`triton-prefill` on both V100 and A100. This backend avoids materializing the
-full attention matrix and is the recommended path for `1kx128`.
+The default attention backend is `--attention-backend auto`:
+- V100: resolves to `sdpa` (PyTorch 2.11+ does not ship Volta kernels).
+- A100 and newer: resolves to `triton-prefill`, which avoids materializing the
+  full attention matrix and is the recommended path for `1kx128`.
 
 ## Optional Attention Backends
 
@@ -123,7 +174,7 @@ The reference check is skipped for `1kx128` because SDPA may run out of memory.
 ## CLI
 
 ```bash
-../.venv/bin/python run_block.py \
+python run_block.py \
   --case {1k,8k,1kx8,1kx128,all} \
   --tp-size {1,4,8} \
   --dtype {auto,float16,bfloat16,float32} \

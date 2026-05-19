@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-../.venv/bin/python run_block.py --case all --tp-size 1 "$@"
+# shellcheck source=env.sh
+source "./env.sh"
+
+"$PYTHON" run_block.py --case all --tp-size 1 "$@"

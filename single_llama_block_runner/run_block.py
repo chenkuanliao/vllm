@@ -92,6 +92,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def verify_cuda_kernels(device: torch.device) -> None:
+    try:
+        probe = torch.randn(1, device=device, dtype=torch.float16)
+        del probe
+    except torch.AcceleratorError as exc:
+        raise RuntimeError(
+            "PyTorch cannot run CUDA kernels on this GPU. Tesla V100 "
+            "(compute capability 7.0) is not supported by torch 2.11; install "
+            "torch 2.6+cu124 in the vllm-py312 conda env:\n"
+            "  conda activate vllm-py312\n"
+            "  pip install torch==2.6.0+cu124 torchvision torchaudio "
+            "--index-url https://download.pytorch.org/whl/cu124\n"
+            "The runner defaults to --attention-backend sdpa on V100. See "
+            "single_llama_block_runner/README.md for details."
+        ) from exc
+
+
 def setup_runtime(tp_size: int) -> Runtime:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark.")
@@ -121,6 +138,7 @@ def setup_runtime(tp_size: int) -> Runtime:
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
+    verify_cuda_kernels(device)
     capability = torch.cuda.get_device_capability(device)
     gpu_name = torch.cuda.get_device_name(device)
     return Runtime(
@@ -155,7 +173,15 @@ def resolve_dtype(dtype_arg: str, runtime: Runtime) -> torch.dtype:
 
 def resolve_attention_backend(backend_arg: str, runtime: Runtime) -> str:
     if backend_arg == "auto":
+        if runtime.capability < (7, 5):
+            return "sdpa"
         return "triton-prefill"
+    if backend_arg == "triton-prefill" and runtime.capability < (7, 5):
+        raise RuntimeError(
+            "triton-prefill requires vLLM kernels built for this GPU and "
+            "PyTorch with Volta (sm_70) support. On V100, use the default "
+            "auto backend (sdpa) or pass --attention-backend sdpa."
+        )
     if backend_arg == "flash-attn-varlen":
         if runtime.capability[0] < 8:
             raise RuntimeError(
