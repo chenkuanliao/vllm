@@ -4,4 +4,5 @@ cd "$(dirname "$0")"
 # shellcheck source=env.sh
 source "./env.sh"
 
-"$TORCHRUN" --nproc-per-node=8 run_block.py --case all --tp-size 8 "$@"
+"$TORCHRUN" --nproc-per-node=8 run_block.py --case all --tp-size 8 \
+  --output-json "$(results_json_path 8)" "$@"

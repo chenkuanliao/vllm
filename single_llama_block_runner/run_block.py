@@ -10,12 +10,16 @@ kernel by default, with optional FlashAttention varlen and PyTorch SDPA paths.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import statistics
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -55,6 +59,23 @@ class Runtime:
 
 
 @dataclass
+class CaseBenchmarkResult:
+    case: str
+    num_seqs: int
+    seq_len: int
+    total_tokens: int
+    forward_ms: list[float]
+    mean_forward_ms: float
+    std_forward_ms: float
+    min_forward_ms: float
+    max_forward_ms: float
+    tokens_per_second: float
+    peak_memory_gib: float
+    output_shape: tuple[int, ...]
+    reference_check: str | None = None
+
+
+@dataclass
 class BlockWeights:
     gam_a: torch.Tensor
     gam_f: torch.Tensor
@@ -89,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--benchmark-iters", type=int, default=20)
     parser.add_argument("--check-reference", action="store_true")
+    parser.add_argument(
+        "--output-json",
+        type=str,
+        default="",
+        help="Path to write benchmark results as JSON (rank 0 only).",
+    )
     return parser.parse_args()
 
 
@@ -447,7 +474,8 @@ def synchronize(runtime: Runtime) -> None:
 
 
 def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
-                   backend: str, args: argparse.Namespace) -> None:
+                   backend: str,
+                   args: argparse.Namespace) -> CaseBenchmarkResult:
     if backend == "sdpa" and case_name == "1kx128":
         rank0_print(
             runtime,
@@ -473,31 +501,61 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
         synchronize(runtime)
 
         torch.cuda.reset_peak_memory_stats(runtime.device)
-        start = time.perf_counter()
+        forward_ms: list[float] = []
         for _ in range(args.benchmark_iters):
+            synchronize(runtime)
+            start = time.perf_counter()
             output = run_once(backend)
-        synchronize(runtime)
-        elapsed = time.perf_counter() - start
+            synchronize(runtime)
+            forward_ms.append((time.perf_counter() - start) * 1000.0)
 
         assert output is not None
-        mean_ms = elapsed * 1000.0 / max(args.benchmark_iters, 1)
+        mean_ms = statistics.mean(forward_ms)
+        std_ms = statistics.stdev(forward_ms) if len(forward_ms) > 1 else 0.0
+        min_ms = min(forward_ms)
+        max_ms = max(forward_ms)
         tok_per_s = total_tokens / (mean_ms / 1000.0)
         peak_gib = torch.cuda.max_memory_allocated(runtime.device) / (1024**3)
+        reference_check: str | None = None
 
         if args.check_reference:
             if case_name == "1kx128":
-                rank0_print(runtime,
-                            "reference_check=skipped case=1kx128 reason=sdpa_may_oom")
+                reference_check = "skipped:sdpa_may_oom"
+                rank0_print(
+                    runtime,
+                    "reference_check=skipped case=1kx128 reason=sdpa_may_oom",
+                )
             elif backend == "sdpa":
-                rank0_print(runtime,
-                            f"reference_check=skipped case={case_name} reason=backend_is_sdpa")
+                reference_check = "skipped:backend_is_sdpa"
+                rank0_print(
+                    runtime,
+                    f"reference_check=skipped case={case_name} "
+                    "reason=backend_is_sdpa",
+                )
             else:
                 ref_output = run_once("sdpa")
                 torch.testing.assert_close(output,
                                            ref_output,
                                            rtol=5e-2,
                                            atol=5e-2)
+                reference_check = "passed"
                 rank0_print(runtime, f"reference_check=passed case={case_name}")
+
+    result = CaseBenchmarkResult(
+        case=case_name,
+        num_seqs=num_seqs,
+        seq_len=seq_len,
+        total_tokens=total_tokens,
+        forward_ms=forward_ms,
+        mean_forward_ms=mean_ms,
+        std_forward_ms=std_ms,
+        min_forward_ms=min_ms,
+        max_forward_ms=max_ms,
+        tokens_per_second=tok_per_s,
+        peak_memory_gib=peak_gib,
+        output_shape=tuple(output.shape),
+        reference_check=reference_check,
+    )
 
     rank0_print(
         runtime,
@@ -510,6 +568,9 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
             f"total_tokens={total_tokens}",
             f"attention_backend={backend}",
             f"mean_forward_ms={mean_ms:.3f}",
+            f"std_forward_ms={std_ms:.3f}",
+            f"min_forward_ms={min_ms:.3f}",
+            f"max_forward_ms={max_ms:.3f}",
             f"tokens_per_second={tok_per_s:.2f}",
             f"peak_memory_gib={peak_gib:.2f}",
             f"output_shape={tuple(output.shape)}",
@@ -519,6 +580,39 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
     del x, positions, b_start_loc, b_seq_len, cu_seqlens, cos_cache, sin_cache
     del weights, output
     torch.cuda.empty_cache()
+    return result
+
+
+def write_results_json(path: str, payload: dict[str, Any]) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
+def build_results_payload(
+    *,
+    runtime: Runtime,
+    dtype: torch.dtype,
+    backend: str,
+    args: argparse.Namespace,
+    case_results: list[CaseBenchmarkResult],
+) -> dict[str, Any]:
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "gpu_name": runtime.gpu_name,
+        "capability": f"{runtime.capability[0]}.{runtime.capability[1]}",
+        "tp_size": runtime.tp_size,
+        "world_size": runtime.world_size,
+        "dtype": str(dtype).replace("torch.", ""),
+        "attention_backend": backend,
+        "seed": args.seed,
+        "warmup_iters": args.warmup_iters,
+        "benchmark_iters": args.benchmark_iters,
+        "check_reference": args.check_reference,
+        "cases": [asdict(result) for result in case_results],
+    }
 
 
 def main() -> None:
@@ -539,10 +633,22 @@ def main() -> None:
     )
 
     case_names = list(CASES) if args.case == "all" else [args.case]
+    case_results: list[CaseBenchmarkResult] = []
     try:
         for case_name in case_names:
-            benchmark_case(case_name, runtime, dtype, backend, args)
+            case_results.append(
+                benchmark_case(case_name, runtime, dtype, backend, args))
     finally:
+        if runtime.rank == 0 and args.output_json:
+            payload = build_results_payload(
+                runtime=runtime,
+                dtype=dtype,
+                backend=backend,
+                args=args,
+                case_results=case_results,
+            )
+            write_results_json(args.output_json, payload)
+            rank0_print(runtime, f"results_json={args.output_json}")
         if runtime.is_distributed:
             dist.destroy_process_group()
 

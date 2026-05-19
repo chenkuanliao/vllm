@@ -181,7 +181,8 @@ python run_block.py \
   --attention-backend {auto,triton-prefill,flash-attn-varlen,sdpa} \
   --seed 0 \
   --warmup-iters 5 \
-  --benchmark-iters 20
+  --benchmark-iters 20 \
+  --output-json results/custom.json
 ```
 
 ## Output
@@ -191,8 +192,21 @@ Rank 0 prints one line per case:
 ```text
 case=1kx128 tp_size=8 dtype=float16 num_seqs=128 seq_len=1024
 total_tokens=131072 attention_backend=triton-prefill mean_forward_ms=...
+std_forward_ms=... min_forward_ms=... max_forward_ms=...
 tokens_per_second=... peak_memory_gib=... output_shape=(131072, 4096)
 ```
+
+The launch scripts write a timestamped JSON file under `results/`, for example
+`results/tp8_20260519T153045Z.json`. Override the path with `--output-json`:
+
+```bash
+./run_1gpu.sh --output-json results/my_run.json
+```
+
+Each JSON file includes run metadata (GPU, dtype, backend, iteration counts) and
+per-case stats: every benchmark iteration time in `forward_ms`, plus
+`mean_forward_ms`, `std_forward_ms`, `min_forward_ms`, `max_forward_ms`,
+`tokens_per_second`, `peak_memory_gib`, and `output_shape`.
 
 ## Model Shape
 
