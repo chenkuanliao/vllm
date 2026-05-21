@@ -55,11 +55,14 @@ cd /path/to/vllm
 conda create -n vllm-py312 python=3.12 -y
 conda activate vllm-py312
 
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install torch==2.11.0 torchaudio torchvision \
+conda install -c conda-forge uv -y
+uv pip install --python "$CONDA_PREFIX/bin/python" --upgrade setuptools wheel
+uv pip install --python "$CONDA_PREFIX/bin/python" \
+  torch==2.11.0 torchaudio torchvision \
   --index-url https://download.pytorch.org/whl/cu129
 VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 VLLM_USE_PRECOMPILED=1 \
-  python -m pip install -e .
+  uv pip install --python "$CONDA_PREFIX/bin/python" -e . \
+  --torch-backend=auto
 ```
 
 Fresh 8xA100 setup and run:
@@ -70,11 +73,14 @@ cd /path/to/vllm
 conda create -n vllm-py312 python=3.12 -y
 conda activate vllm-py312
 
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install torch==2.11.0 torchaudio torchvision \
+conda install -c conda-forge uv -y
+uv pip install --python "$CONDA_PREFIX/bin/python" --upgrade setuptools wheel
+uv pip install --python "$CONDA_PREFIX/bin/python" \
+  torch==2.11.0 torchaudio torchvision \
   --index-url https://download.pytorch.org/whl/cu129
 VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 VLLM_USE_PRECOMPILED=1 \
-  python -m pip install -e .
+  uv pip install --python "$CONDA_PREFIX/bin/python" -e . \
+  --torch-backend=auto
 
 cd single_llama_block_runner
 ./run_all.sh
