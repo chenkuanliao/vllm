@@ -39,7 +39,7 @@ conda create -n vllm-py312 python=3.12 -y
 conda activate vllm-py312
 
 python -m pip install --upgrade pip setuptools wheel
-pip install torch==2.6.0+cu124 torchvision torchaudio \
+python -m pip install torch==2.6.0+cu124 torchvision torchaudio \
   --index-url https://download.pytorch.org/whl/cu124
 ```
 
@@ -56,11 +56,35 @@ conda create -n vllm-py312 python=3.12 -y
 conda activate vllm-py312
 
 python -m pip install --upgrade pip setuptools wheel
-pip install torch==2.11.0 torchaudio torchvision \
+python -m pip install torch==2.11.0 torchaudio torchvision \
   --index-url https://download.pytorch.org/whl/cu129
 VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 VLLM_USE_PRECOMPILED=1 \
   python -m pip install -e .
 ```
+
+Fresh 8xA100 setup and run:
+
+```bash
+cd /path/to/vllm
+
+conda create -n vllm-py312 python=3.12 -y
+conda activate vllm-py312
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install torch==2.11.0 torchaudio torchvision \
+  --index-url https://download.pytorch.org/whl/cu129
+VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 VLLM_USE_PRECOMPILED=1 \
+  python -m pip install -e .
+
+cd single_llama_block_runner
+./run_all.sh
+```
+
+`run_all.sh` runs `run_1gpu.sh`, `run_4gpu.sh`, then `run_8gpu.sh`. The full
+script therefore requires at least 8 visible A100 GPUs. If the machine has
+fewer visible GPUs, run only the matching launch script. The A100 default
+`--attention-backend auto` resolves to `triton-prefill`, so the editable vLLM
+install above is required.
 
 The launch scripts prefer `../.venv` when present, otherwise the `vllm-py312`
 conda env (override with `VLLM_CONDA_ENV`), otherwise `python`/`torchrun`
