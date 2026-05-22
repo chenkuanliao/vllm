@@ -202,6 +202,13 @@ def resolve_attention_backend(backend_arg: str, runtime: Runtime) -> str:
     if backend_arg == "auto":
         if runtime.capability < (7, 5):
             return "sdpa"
+        if "A100" in runtime.gpu_name and runtime.capability >= (8, 0):
+            from vllm.v1.attention.backends.fa_utils import (
+                is_flash_attn_varlen_func_available,
+            )
+
+            if is_flash_attn_varlen_func_available():
+                return "flash-attn-varlen"
         return "triton-prefill"
     if backend_arg == "triton-prefill" and runtime.capability < (7, 5):
         raise RuntimeError(
@@ -390,6 +397,7 @@ def attention_flash_varlen(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         dropout_p=0.0,
         softmax_scale=HEAD_DIM**-0.5,
         causal=True,
+        fa_version=2,
     )
     if isinstance(out, tuple):
         out = out[0]

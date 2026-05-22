@@ -44,8 +44,8 @@ python -m pip install torch==2.6.0+cu124 torchvision torchaudio \
 ```
 
 No vLLM install is required for the default V100 path (`--attention-backend
-auto` selects `sdpa`). For `triton-prefill` on large packed cases such as
-`1kx128`, build vLLM from source against the same torch 2.6+cu124 stack.
+auto` selects `sdpa`). For A100 FlashAttention-2 varlen or `triton-prefill`,
+build vLLM from source against the same torch 2.6+cu124 stack.
 
 Conda on A100 and newer (compute capability >= 8.0):
 
@@ -89,8 +89,8 @@ cd single_llama_block_runner
 `run_all.sh` runs `run_1gpu.sh`, `run_4gpu.sh`, then `run_8gpu.sh`. The full
 script therefore requires at least 8 visible A100 GPUs. If the machine has
 fewer visible GPUs, run only the matching launch script. The A100 default
-`--attention-backend auto` resolves to `triton-prefill`, so the editable vLLM
-install above is required.
+`--attention-backend auto` resolves to `flash-attn-varlen` backed by FA2, so
+the editable vLLM install above is required.
 
 The launch scripts prefer `../.venv` when present, otherwise the `vllm-py312`
 conda env (override with `VLLM_CONDA_ENV`), otherwise `python`/`torchrun`
@@ -161,26 +161,26 @@ The script detects the GPU name and compute capability at runtime.
 
 The default attention backend is `--attention-backend auto`:
 - V100: resolves to `sdpa` (PyTorch 2.11+ does not ship Volta kernels).
-- A100 and newer: resolves to `triton-prefill`, which avoids materializing the
-  full attention matrix and is the recommended path for `1kx128`.
+- A100: resolves to `flash-attn-varlen`, which uses vLLM's FlashAttention-2
+  varlen kernel.
 
 ## Optional Attention Backends
 
-Portable default:
+Triton prefill fallback:
 
 ```bash
 ./run_8gpu.sh --attention-backend triton-prefill --dtype float16
 ```
 
-A100 FlashAttention varlen experiment:
+A100 FlashAttention-2 varlen path:
 
 ```bash
 ./run_8gpu.sh --attention-backend flash-attn-varlen
 ```
 
-`flash-attn-varlen` is never selected automatically. If requested on V100, the
-script exits with a clear error because this vLLM build requires compute
-capability >= 8.0 for that path.
+`flash-attn-varlen` is selected automatically on A100 and newer when available.
+If requested on V100, the script exits with a clear error because this vLLM
+build requires compute capability >= 8.0 for that path.
 
 PyTorch SDPA debug path:
 
@@ -189,7 +189,7 @@ PyTorch SDPA debug path:
 ```
 
 SDPA can require a large attention workspace for `1kx128`; use
-`triton-prefill` for large packed cases.
+`flash-attn-varlen` or `triton-prefill` for large packed cases.
 
 ## Reference Check
 
@@ -221,7 +221,7 @@ Rank 0 prints one line per case:
 
 ```text
 case=1kx128 tp_size=8 dtype=float16 num_seqs=128 seq_len=1024
-total_tokens=131072 attention_backend=triton-prefill mean_forward_ms=...
+total_tokens=131072 attention_backend=flash-attn-varlen mean_forward_ms=...
 std_forward_ms=... min_forward_ms=... max_forward_ms=...
 tokens_per_second=... peak_memory_gib=... output_shape=(131072, 4096)
 ```
