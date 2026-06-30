@@ -121,11 +121,14 @@ On A100, the default `float16` works, and `--dtype bfloat16` is optional.
 |---|---:|---:|
 | `1k` | 1 sequence x 1024 | 1024 |
 | `8k` | 1 sequence x 8192 | 8192 |
+| `128k` | 1 sequence x 131072 | 131072 |
 | `1kx8` | 8 sequences x 1024 packed | 8192 |
 | `1kx128` | 128 sequences x 1024 packed | 131072 |
 
-`1kx128` means 128 independent packed 1024-token causal sequences, not one
-131072-token sequence.
+`128k` is one packed 131072-token causal sequence. `1kx128` means 128
+independent packed 1024-token causal sequences, not one 131072-token sequence.
+Both `128k` and `1kx128` use 131072 total tokens but different sharding
+strategies.
 
 ## Distributed Strategies
 
@@ -135,6 +138,7 @@ Default `--parallel-strategy benchmark` matches the benchmark directory:
 |---|---|---|
 | `1k` | `sequence_sharded` | Split the sequence dimension across ranks, all-gather K/V, then use offset-aware causal attention. |
 | `8k` | `sequence_sharded` | Same as `1k`, with a longer global sequence. |
+| `128k` | `sequence_sharded` | Same as `8k`, with a 131072-token global sequence. |
 | `1kx8` | `batch_sharded` | Split independent packed sequences across ranks and run local packed causal attention. |
 | `1kx128` | `batch_sharded` | Same as `1kx8`, with more local sequences per rank. |
 
@@ -217,7 +221,7 @@ PyTorch SDPA debug path:
 ./run_1gpu.sh --case 1k --attention-backend sdpa
 ```
 
-SDPA can require a large attention workspace for `1kx128`; use
+SDPA can require a large attention workspace for `128k` and `1kx128`; use
 `flash-attn-varlen` or `triton-prefill` for large packed cases.
 
 ## Reference Check
@@ -228,13 +232,14 @@ For small cases, compare the selected backend against SDPA:
 ./run_1gpu.sh --case 1k --warmup-iters 1 --benchmark-iters 1 --check-reference
 ```
 
-The reference check is skipped for `1kx128` because SDPA may run out of memory.
+The reference check is skipped for `128k` and `1kx128` because SDPA may run
+out of memory.
 
 ## CLI
 
 ```bash
 python run_block.py \
-  --case {1k,8k,1kx8,1kx128,all} \
+  --case {1k,8k,128k,1kx8,1kx128,all} \
   --tp-size {1,4,8} \
   --parallel-strategy {benchmark,tensor-parallel} \
   --dtype {auto,float16,bfloat16,float32} \

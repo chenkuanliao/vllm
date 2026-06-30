@@ -48,9 +48,12 @@ class LlamaCase:
 CASES: dict[str, LlamaCase] = {
     "1k": LlamaCase(num_seqs=1, seq_len=1024, strategy="sequence_sharded"),
     "8k": LlamaCase(num_seqs=1, seq_len=8192, strategy="sequence_sharded"),
+    "128k": LlamaCase(num_seqs=1, seq_len=131072, strategy="sequence_sharded"),
     "1kx8": LlamaCase(num_seqs=8, seq_len=1024, strategy="batch_sharded"),
     "1kx128": LlamaCase(num_seqs=128, seq_len=1024, strategy="batch_sharded"),
 }
+
+SDPA_OOM_RISK_CASES = frozenset({"128k", "1kx128"})
 
 
 @dataclass(frozen=True)
@@ -615,10 +618,10 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
                    backend: str,
                    args: argparse.Namespace) -> CaseBenchmarkResult:
     case = CASES[case_name]
-    if backend == "sdpa" and case_name == "1kx128":
+    if backend == "sdpa" and case_name in SDPA_OOM_RISK_CASES:
         rank0_print(
             runtime,
-            "warning: sdpa on 1kx128 may require a very large attention "
+            f"warning: sdpa on {case_name} may require a very large attention "
             "workspace and can OOM; triton-prefill is recommended.",
         )
 
@@ -675,11 +678,12 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
         reference_check: str | None = None
 
         if args.check_reference:
-            if case_name == "1kx128":
+            if case_name in SDPA_OOM_RISK_CASES:
                 reference_check = "skipped:sdpa_may_oom"
                 rank0_print(
                     runtime,
-                    "reference_check=skipped case=1kx128 reason=sdpa_may_oom",
+                    f"reference_check=skipped case={case_name} "
+                    "reason=sdpa_may_oom",
                 )
             elif effective_backend == "sdpa":
                 reference_check = "skipped:backend_is_sdpa"
