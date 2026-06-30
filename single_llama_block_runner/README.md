@@ -2,11 +2,16 @@
 
 This directory contains a standalone synthetic-weight benchmark for one Llama
 decoder block. It is designed to run from inside this directory on V100 and
-A100 systems with tensor parallel sizes 1, 4, and 8.
+A100 systems with 1, 4, and 8 GPU launches.
 
 The runner does not use a KV cache, tokenizer, checkpoint loader, vLLM engine,
 or vLLM scheduler. It uses PyTorch for the block math and vLLM's Triton prefill
 attention op by default.
+
+By default, distributed runs use the same high-level strategies as
+`benchmarks/jax-llama` and `benchmarks/pytorch-llama`: replicated weights with
+batch-sharded or sequence-sharded activations. The original tensor-parallel
+synthetic mode is still available with `--parallel-strategy tensor-parallel`.
 
 ## Environment Setup
 
@@ -122,6 +127,30 @@ On A100, the default `float16` works, and `--dtype bfloat16` is optional.
 `1kx128` means 128 independent packed 1024-token causal sequences, not one
 131072-token sequence.
 
+## Distributed Strategies
+
+Default `--parallel-strategy benchmark` matches the benchmark directory:
+
+| Case | Strategy | Distributed behavior |
+|---|---|---|
+| `1k` | `sequence_sharded` | Split the sequence dimension across ranks, all-gather K/V, then use offset-aware causal attention. |
+| `8k` | `sequence_sharded` | Same as `1k`, with a longer global sequence. |
+| `1kx8` | `batch_sharded` | Split independent packed sequences across ranks and run local packed causal attention. |
+| `1kx128` | `batch_sharded` | Same as `1kx8`, with more local sequences per rank. |
+
+Batch-sharded cases keep using the selected packed vLLM attention backend on
+each rank. Sequence-sharded cases need an offset-aware causal mask after K/V
+gather; the runner uses SDPA for that attention step and reports it as the
+per-case effective `attention_backend`.
+
+Legacy tensor-parallel mode shards Q/K/V heads and FFN intermediate weights,
+keeps full inputs on every rank, and all-reduces the output projection and FFN
+down projection:
+
+```bash
+./run_8gpu.sh --parallel-strategy tensor-parallel
+```
+
 ## Quick Start
 
 From the vLLM repo root:
@@ -207,6 +236,7 @@ The reference check is skipped for `1kx128` because SDPA may run out of memory.
 python run_block.py \
   --case {1k,8k,1kx8,1kx128,all} \
   --tp-size {1,4,8} \
+  --parallel-strategy {benchmark,tensor-parallel} \
   --dtype {auto,float16,bfloat16,float32} \
   --attention-backend {auto,triton-prefill,flash-attn-varlen,sdpa} \
   --seed 0 \
@@ -220,10 +250,11 @@ python run_block.py \
 Rank 0 prints one line per case:
 
 ```text
-case=1kx128 tp_size=8 dtype=float16 num_seqs=128 seq_len=1024
-total_tokens=131072 attention_backend=flash-attn-varlen mean_forward_ms=...
-std_forward_ms=... min_forward_ms=... max_forward_ms=...
-tokens_per_second=... peak_memory_gib=... output_shape=(131072, 4096)
+case=1kx128 strategy=batch_sharded tp_size=8 dtype=float16
+global_num_seqs=128 global_seq_len=1024 local_num_seqs=16 local_seq_len=1024
+total_tokens=131072 local_tokens=16384 attention_backend=flash-attn-varlen
+mean_forward_ms=... std_forward_ms=... min_forward_ms=... max_forward_ms=...
+tokens_per_second=... peak_memory_gib=... output_shape=(16384, 4096)
 ```
 
 The launch scripts write a timestamped JSON file under `results/`, for example
@@ -233,8 +264,9 @@ The launch scripts write a timestamped JSON file under `results/`, for example
 ./run_1gpu.sh --output-json results/my_run.json
 ```
 
-Each JSON file includes run metadata (GPU, dtype, backend, iteration counts) and
-per-case stats: every benchmark iteration time in `forward_ms`, plus
+Each JSON file includes run metadata (GPU, dtype, requested backend, parallel
+strategy, iteration counts) and per-case stats: strategy, effective attention
+backend, global/local shape, every benchmark iteration time in `forward_ms`, plus
 `mean_forward_ms`, `std_forward_ms`, `min_forward_ms`, `max_forward_ms`,
 `tokens_per_second`, `peak_memory_gib`, and `output_shape`.
 

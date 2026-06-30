@@ -38,11 +38,18 @@ HEAD_DIM = 128
 FFN_INTER = 14336
 EPS = 1e-5
 
-CASES: dict[str, tuple[int, int]] = {
-    "1k": (1, 1024),
-    "8k": (1, 8192),
-    "1kx8": (8, 1024),
-    "1kx128": (128, 1024),
+@dataclass(frozen=True)
+class LlamaCase:
+    num_seqs: int
+    seq_len: int
+    strategy: str
+
+
+CASES: dict[str, LlamaCase] = {
+    "1k": LlamaCase(num_seqs=1, seq_len=1024, strategy="sequence_sharded"),
+    "8k": LlamaCase(num_seqs=1, seq_len=8192, strategy="sequence_sharded"),
+    "1kx8": LlamaCase(num_seqs=8, seq_len=1024, strategy="batch_sharded"),
+    "1kx128": LlamaCase(num_seqs=128, seq_len=1024, strategy="batch_sharded"),
 }
 
 
@@ -61,9 +68,14 @@ class Runtime:
 @dataclass
 class CaseBenchmarkResult:
     case: str
+    strategy: str
     num_seqs: int
     seq_len: int
+    local_num_seqs: int
+    local_seq_len: int
     total_tokens: int
+    local_tokens: int
+    attention_backend: str
     forward_ms: list[float]
     mean_forward_ms: float
     std_forward_ms: float
@@ -95,6 +107,17 @@ def parse_args() -> argparse.Namespace:
                         choices=[*CASES.keys(), "all"],
                         default="all")
     parser.add_argument("--tp-size", type=int, choices=[1, 4, 8], default=1)
+    parser.add_argument(
+        "--parallel-strategy",
+        choices=["benchmark", "tensor-parallel"],
+        default="benchmark",
+        help=(
+            "benchmark matches benchmarks/{jax,pytorch}-llama: replicated "
+            "weights with batch- or sequence-sharded activations. "
+            "tensor-parallel keeps the original vLLM-style tensor-parallel "
+            "synthetic runner."
+        ),
+    )
     parser.add_argument("--dtype",
                         choices=["auto", "float16", "bfloat16", "float32"],
                         default="auto")
@@ -246,6 +269,20 @@ def all_reduce_sum(x: torch.Tensor, runtime: Runtime) -> torch.Tensor:
     return x
 
 
+def all_gather_sequence_heads(local: torch.Tensor, runtime: Runtime,
+                              num_seqs: int) -> torch.Tensor:
+    if not runtime.is_distributed:
+        return local
+    local_seq_len = local.shape[0] // num_seqs
+    local_4d = local.view(num_seqs, local_seq_len, local.shape[1],
+                          local.shape[2]).contiguous()
+    gathered = [torch.empty_like(local_4d) for _ in range(runtime.world_size)]
+    dist.all_gather(gathered, local_4d)
+    return torch.cat(gathered, dim=1).reshape(num_seqs * local_seq_len *
+                                              runtime.world_size,
+                                              local.shape[1], local.shape[2])
+
+
 def make_randn(shape: tuple[int, ...],
                *,
                device: torch.device,
@@ -257,43 +294,86 @@ def make_randn(shape: tuple[int, ...],
     return torch.randn(shape, device=device, dtype=dtype, generator=gen) * scale
 
 
-def make_case_inputs(case_name: str, device: torch.device,
-                     dtype: torch.dtype,
-                     seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                                        torch.Tensor, torch.Tensor, int, int]:
-    num_seqs, seq_len = CASES[case_name]
+def make_sequence_metadata(num_seqs: int, seq_len: int, position_offset: int,
+                           device: torch.device
+                           ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                      torch.Tensor]:
+    positions = (
+        torch.arange(position_offset,
+                     position_offset + seq_len,
+                     device=device,
+                     dtype=torch.long).repeat(num_seqs)
+    )
+    b_start_loc = torch.arange(num_seqs, device=device,
+                               dtype=torch.int32) * seq_len
+    b_seq_len = torch.full((num_seqs, ), seq_len, device=device, dtype=torch.int32)
+    cu_seqlens = torch.arange(num_seqs + 1, device=device,
+                              dtype=torch.int32) * seq_len
+    return positions, b_start_loc, b_seq_len, cu_seqlens
+
+
+def make_case_inputs(case_name: str, runtime: Runtime, dtype: torch.dtype,
+                     seed: int, parallel_strategy: str
+                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                torch.Tensor, torch.Tensor, int, int, int, int]:
+    case = CASES[case_name]
+    num_seqs = case.num_seqs
+    seq_len = case.seq_len
     total_tokens = num_seqs * seq_len
     x = make_randn((total_tokens, D),
-                   device=device,
+                   device=runtime.device,
                    dtype=dtype,
                    seed=seed + 11,
                    scale=0.02)
-    positions = torch.arange(seq_len, device=device, dtype=torch.long).repeat(num_seqs)
-    b_start_loc = torch.arange(num_seqs, device=device,
-                               dtype=torch.int32) * seq_len
-    b_seq_len = torch.full((num_seqs, ),
-                           seq_len,
-                           device=device,
-                           dtype=torch.int32)
-    cu_seqlens = torch.arange(num_seqs + 1, device=device,
-                              dtype=torch.int32) * seq_len
-    return x, positions, b_start_loc, b_seq_len, cu_seqlens, num_seqs, seq_len
+    local_num_seqs = num_seqs
+    local_seq_len = seq_len
+    position_offset = 0
+
+    if runtime.world_size > 1 and parallel_strategy == "benchmark":
+        x_3d = x.view(num_seqs, seq_len, D)
+        if case.strategy == "batch_sharded":
+            if num_seqs % runtime.world_size != 0:
+                raise RuntimeError(
+                    f"{case_name} num_seqs={num_seqs} must be divisible by "
+                    f"world_size={runtime.world_size} for batch_sharded."
+                )
+            local_num_seqs = num_seqs // runtime.world_size
+            start = runtime.rank * local_num_seqs
+            x = x_3d.narrow(0, start, local_num_seqs).contiguous().view(
+                local_num_seqs * seq_len, D)
+        else:
+            if seq_len % runtime.world_size != 0:
+                raise RuntimeError(
+                    f"{case_name} seq_len={seq_len} must be divisible by "
+                    f"world_size={runtime.world_size} for sequence_sharded."
+                )
+            local_seq_len = seq_len // runtime.world_size
+            position_offset = runtime.rank * local_seq_len
+            x = x_3d.narrow(1, position_offset, local_seq_len).contiguous().view(
+                num_seqs * local_seq_len, D)
+
+    positions, b_start_loc, b_seq_len, cu_seqlens = make_sequence_metadata(
+        local_num_seqs, local_seq_len, position_offset, runtime.device)
+    return (x, positions, b_start_loc, b_seq_len, cu_seqlens, local_num_seqs,
+            local_seq_len, num_seqs, seq_len)
 
 
-def make_weights(runtime: Runtime, dtype: torch.dtype,
+def make_weights(runtime: Runtime, dtype: torch.dtype, parallel_strategy: str,
                  seed: int) -> tuple[BlockWeights, int, int, int]:
-    if N_Q_HEADS % runtime.tp_size != 0:
+    shard_count = runtime.tp_size if parallel_strategy == "tensor-parallel" else 1
+    if N_Q_HEADS % shard_count != 0:
         raise RuntimeError("N_Q_HEADS must be divisible by tp_size.")
-    if N_KV_HEADS % runtime.tp_size != 0:
+    if N_KV_HEADS % shard_count != 0:
         raise RuntimeError("N_KV_HEADS must be divisible by tp_size.")
-    if FFN_INTER % runtime.tp_size != 0:
+    if FFN_INTER % shard_count != 0:
         raise RuntimeError("FFN_INTER must be divisible by tp_size.")
 
-    q_heads_local = N_Q_HEADS // runtime.tp_size
-    kv_heads_local = N_KV_HEADS // runtime.tp_size
-    ffn_inter_local = FFN_INTER // runtime.tp_size
+    q_heads_local = N_Q_HEADS // shard_count
+    kv_heads_local = N_KV_HEADS // shard_count
+    ffn_inter_local = FFN_INTER // shard_count
 
-    shard_seed = seed + 100000 + runtime.rank * 1000
+    rank_seed = runtime.rank if parallel_strategy == "tensor-parallel" else 0
+    shard_seed = seed + 100000 + rank_seed * 1000
     device = runtime.device
 
     weights = BlockWeights(
@@ -430,6 +510,42 @@ def attention_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return out.permute(0, 2, 1, 3).reshape(num_seqs * seq_len, q_heads, HEAD_DIM)
 
 
+def attention_sdpa_sequence_sharded(q: torch.Tensor, k: torch.Tensor,
+                                    v: torch.Tensor, num_seqs: int,
+                                    local_seq_len: int, full_seq_len: int,
+                                    query_offset: int) -> torch.Tensor:
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    q_heads = q.shape[1]
+    kv_heads = k.shape[1]
+    if q_heads % kv_heads != 0:
+        raise RuntimeError(
+            f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}.")
+
+    q4 = q.view(num_seqs, local_seq_len, q_heads, HEAD_DIM).permute(0, 2, 1, 3)
+    k4 = k.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM).permute(0, 2, 1, 3)
+    v4 = v.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM).permute(0, 2, 1, 3)
+    repeat = q_heads // kv_heads
+    if repeat != 1:
+        k4 = k4.repeat_interleave(repeat, dim=1)
+        v4 = v4.repeat_interleave(repeat, dim=1)
+
+    q_pos = torch.arange(query_offset,
+                         query_offset + local_seq_len,
+                         device=q.device)[:, None]
+    k_pos = torch.arange(full_seq_len, device=q.device)[None, :]
+    attn_mask = (k_pos <= q_pos)[None, None, :, :]
+    out = F.scaled_dot_product_attention(q4,
+                                          k4,
+                                          v4,
+                                          attn_mask=attn_mask,
+                                          dropout_p=0.0,
+                                          is_causal=False)
+    return out.permute(0, 2, 1, 3).reshape(num_seqs * local_seq_len, q_heads,
+                                           HEAD_DIM)
+
+
 def packed_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                      b_start_loc: torch.Tensor, b_seq_len: torch.Tensor,
                      cu_seqlens: torch.Tensor, num_seqs: int, seq_len: int,
@@ -447,7 +563,9 @@ def llama_block_forward(x: torch.Tensor, positions: torch.Tensor,
                         b_start_loc: torch.Tensor, b_seq_len: torch.Tensor,
                         cu_seqlens: torch.Tensor, cos_cache: torch.Tensor,
                         sin_cache: torch.Tensor, num_seqs: int, seq_len: int,
-                        weights: BlockWeights, runtime: Runtime, backend: str
+                        global_num_seqs: int, global_seq_len: int,
+                        weights: BlockWeights, runtime: Runtime, backend: str,
+                        case_strategy: str, parallel_strategy: str
                         ) -> torch.Tensor:
     norm_x = rmsnorm(x, weights.gam_a, EPS)
 
@@ -458,10 +576,21 @@ def llama_block_forward(x: torch.Tensor, positions: torch.Tensor,
     q_r = apply_rope_neox(q_3d, positions, cos_cache, sin_cache)
     k_r = apply_rope_neox(k_3d, positions, cos_cache, sin_cache)
 
-    attn_ctx = packed_attention(q_r, k_r, v_3d, b_start_loc, b_seq_len,
-                                cu_seqlens, num_seqs, seq_len, backend)
+    if (parallel_strategy == "benchmark" and runtime.world_size > 1
+            and case_strategy == "sequence_sharded"):
+        k_full = all_gather_sequence_heads(k_r, runtime, global_num_seqs)
+        v_full = all_gather_sequence_heads(v_3d, runtime, global_num_seqs)
+        query_offset = runtime.rank * seq_len
+        attn_ctx = attention_sdpa_sequence_sharded(q_r, k_full, v_full,
+                                                   global_num_seqs, seq_len,
+                                                   global_seq_len,
+                                                   query_offset)
+    else:
+        attn_ctx = packed_attention(q_r, k_r, v_3d, b_start_loc, b_seq_len,
+                                    cu_seqlens, num_seqs, seq_len, backend)
     attn_out_partial = torch.einsum("shm,hmd->sd", attn_ctx, weights.wo)
-    attn_out = all_reduce_sum(attn_out_partial, runtime)
+    attn_out = (all_reduce_sum(attn_out_partial, runtime)
+                if parallel_strategy == "tensor-parallel" else attn_out_partial)
 
     x_after = x + attn_out
     norm2 = rmsnorm(x_after, weights.gam_f, EPS)
@@ -471,7 +600,8 @@ def llama_block_forward(x: torch.Tensor, positions: torch.Tensor,
     intermed = F.silu(gate) * up
 
     ffn_out_partial = intermed @ weights.w_down
-    ffn_out = all_reduce_sum(ffn_out_partial, runtime)
+    ffn_out = (all_reduce_sum(ffn_out_partial, runtime)
+               if parallel_strategy == "tensor-parallel" else ffn_out_partial)
     return x_after + ffn_out
 
 
@@ -484,6 +614,7 @@ def synchronize(runtime: Runtime) -> None:
 def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
                    backend: str,
                    args: argparse.Namespace) -> CaseBenchmarkResult:
+    case = CASES[case_name]
     if backend == "sdpa" and case_name == "1kx128":
         rank0_print(
             runtime,
@@ -491,21 +622,38 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
             "workspace and can OOM; triton-prefill is recommended.",
         )
 
-    x, positions, b_start_loc, b_seq_len, cu_seqlens, num_seqs, seq_len = (
-        make_case_inputs(case_name, runtime.device, dtype, args.seed))
-    cos_cache, sin_cache = rope_cache(seq_len, runtime.device, dtype)
-    weights, _, _, _ = make_weights(runtime, dtype, args.seed)
-    total_tokens = num_seqs * seq_len
+    effective_backend = backend
+    if (args.parallel_strategy == "benchmark" and runtime.world_size > 1
+            and case.strategy == "sequence_sharded"):
+        effective_backend = "sdpa"
+    if effective_backend != backend:
+        rank0_print(
+            runtime,
+            f"case={case_name} strategy=sequence_sharded uses sdpa attention "
+            "for offset-aware causal masking after K/V gather.",
+        )
+
+    (x, positions, b_start_loc, b_seq_len, cu_seqlens, num_seqs, seq_len,
+     global_num_seqs, global_seq_len) = make_case_inputs(
+         case_name, runtime, dtype, args.seed, args.parallel_strategy)
+    cos_cache, sin_cache = rope_cache(global_seq_len, runtime.device, dtype)
+    weights, _, _, _ = make_weights(runtime, dtype, args.parallel_strategy,
+                                    args.seed)
+    total_tokens = global_num_seqs * global_seq_len
+    local_tokens = num_seqs * seq_len
 
     def run_once(selected_backend: str) -> torch.Tensor:
         return llama_block_forward(x, positions, b_start_loc, b_seq_len,
-                                   cu_seqlens, cos_cache, sin_cache, num_seqs,
-                                   seq_len, weights, runtime, selected_backend)
+                                   cu_seqlens, cos_cache, sin_cache,
+                                   num_seqs, seq_len, global_num_seqs,
+                                   global_seq_len, weights, runtime,
+                                   selected_backend, case.strategy,
+                                   args.parallel_strategy)
 
     with torch.inference_mode():
         output = None
         for _ in range(args.warmup_iters):
-            output = run_once(backend)
+            output = run_once(effective_backend)
         synchronize(runtime)
 
         torch.cuda.reset_peak_memory_stats(runtime.device)
@@ -513,7 +661,7 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
         for _ in range(args.benchmark_iters):
             synchronize(runtime)
             start = time.perf_counter()
-            output = run_once(backend)
+            output = run_once(effective_backend)
             synchronize(runtime)
             forward_ms.append((time.perf_counter() - start) * 1000.0)
 
@@ -533,7 +681,7 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
                     runtime,
                     "reference_check=skipped case=1kx128 reason=sdpa_may_oom",
                 )
-            elif backend == "sdpa":
+            elif effective_backend == "sdpa":
                 reference_check = "skipped:backend_is_sdpa"
                 rank0_print(
                     runtime,
@@ -551,9 +699,15 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
 
     result = CaseBenchmarkResult(
         case=case_name,
+        strategy=("tensor_parallel" if args.parallel_strategy == "tensor-parallel"
+                  else case.strategy),
         num_seqs=num_seqs,
         seq_len=seq_len,
+        local_num_seqs=num_seqs,
+        local_seq_len=seq_len,
         total_tokens=total_tokens,
+        local_tokens=local_tokens,
+        attention_backend=effective_backend,
         forward_ms=forward_ms,
         mean_forward_ms=mean_ms,
         std_forward_ms=std_ms,
@@ -569,12 +723,16 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
         runtime,
         " ".join([
             f"case={case_name}",
+            f"strategy={result.strategy}",
             f"tp_size={runtime.tp_size}",
             f"dtype={str(dtype).replace('torch.', '')}",
-            f"num_seqs={num_seqs}",
-            f"seq_len={seq_len}",
+            f"global_num_seqs={global_num_seqs}",
+            f"global_seq_len={global_seq_len}",
+            f"local_num_seqs={num_seqs}",
+            f"local_seq_len={seq_len}",
             f"total_tokens={total_tokens}",
-            f"attention_backend={backend}",
+            f"local_tokens={local_tokens}",
+            f"attention_backend={effective_backend}",
             f"mean_forward_ms={mean_ms:.3f}",
             f"std_forward_ms={std_ms:.3f}",
             f"min_forward_ms={min_ms:.3f}",
@@ -613,8 +771,9 @@ def build_results_payload(
         "capability": f"{runtime.capability[0]}.{runtime.capability[1]}",
         "tp_size": runtime.tp_size,
         "world_size": runtime.world_size,
+        "parallel_strategy": args.parallel_strategy,
         "dtype": str(dtype).replace("torch.", ""),
-        "attention_backend": backend,
+        "requested_attention_backend": backend,
         "seed": args.seed,
         "warmup_iters": args.warmup_iters,
         "benchmark_iters": args.benchmark_iters,
@@ -635,8 +794,9 @@ def main() -> None:
             f"gpu={runtime.gpu_name!r}",
             f"capability={runtime.capability[0]}.{runtime.capability[1]}",
             f"tp_size={runtime.tp_size}",
+            f"parallel_strategy={args.parallel_strategy}",
             f"dtype={str(dtype).replace('torch.', '')}",
-            f"attention_backend={backend}",
+            f"requested_attention_backend={backend}",
         ]),
     )
 
