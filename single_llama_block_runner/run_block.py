@@ -10,6 +10,7 @@ kernel by default, with optional FlashAttention varlen and PyTorch SDPA paths.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -41,9 +42,91 @@ EPS = 1e-5
 @dataclass(frozen=True)
 class LlamaCase:
     num_seqs: int
+    # Maximum sequence length; equals every sequence's length unless
+    # sequence_lengths is set.
     seq_len: int
     strategy: str
+    # Ordered per-sequence lengths for variable-length packed cases.
+    sequence_lengths: tuple[int, ...] | None = None
+    sequence_pattern: dict[str, Any] | None = None
 
+    @property
+    def lengths(self) -> tuple[int, ...]:
+        if self.sequence_lengths is not None:
+            return self.sequence_lengths
+        return (self.seq_len, ) * self.num_seqs
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(self.lengths)
+
+
+# Variable-length packed workloads shared with the Einsummable experiments
+# (experiements/catalog.json and experiements/sequence_patterns.py in the
+# vldb-experiments branch). Each keeps 1kx128's 128-sequence / 131072-token
+# budget. The ordering is reproduced with the same portable sha256-sort-v1
+# recipe and checked against the checksum Einsummable records in every
+# sequence_pattern.json, so both systems run the identical sequence layout.
+VARIABLE_LENGTH_SPECS: dict[str, dict[str, Any]] = {
+    "var-moderate-128": {
+        "algorithm": "sha256-sort-v1",
+        "seed": 42,
+        "length_counts": [[512, 32], [768, 32], [1280, 32], [1536, 32]],
+        "batch_size": 128,
+        "total_tokens": 131072,
+        "sequence_lengths_sha256":
+        "98788f83854bfb6ff2b6e5fedf6661ef3781bbd086b5f18e186447357edd8cba",
+    },
+    "var-strong-128": {
+        "algorithm": "sha256-sort-v1",
+        "seed": 42,
+        "length_counts": [[256, 96], [1536, 16], [5120, 16]],
+        "batch_size": 128,
+        "total_tokens": 131072,
+        "sequence_lengths_sha256":
+        "b1206b5a6e85f731b6554817dd9dc7750727586e118db04966901adcb8c8b222",
+    },
+}
+
+
+def sha256_sort_v1(seed: int, length_counts: list[list[int]]) -> list[int]:
+    """Expand length_counts in order, then permute by SHA256("seed:i")."""
+    expanded = [length for length, count in length_counts for _ in range(count)]
+    order = sorted(range(len(expanded)),
+                   key=lambda i: (hashlib.sha256(
+                       f"{seed}:{i}".encode("ascii")).digest(), i))
+    return [expanded[i] for i in order]
+
+
+def sequence_lengths_sha256(lengths: list[int]) -> str:
+    payload = json.dumps(lengths, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def make_variable_length_case(name: str) -> LlamaCase:
+    spec = VARIABLE_LENGTH_SPECS[name]
+    lengths = sha256_sort_v1(spec["seed"], spec["length_counts"])
+    checksum = sequence_lengths_sha256(lengths)
+    if (len(lengths) != spec["batch_size"]
+            or sum(lengths) != spec["total_tokens"]
+            or checksum != spec["sequence_lengths_sha256"]):
+        raise RuntimeError(
+            f"{name}: generated sequence pattern does not match the "
+            f"Einsummable reference (sha256={checksum}).")
+    return LlamaCase(num_seqs=len(lengths),
+                     seq_len=max(lengths),
+                     strategy="batch_sharded",
+                     sequence_lengths=tuple(lengths),
+                     sequence_pattern={
+                         "algorithm": spec["algorithm"],
+                         "seed": spec["seed"],
+                         "length_counts": spec["length_counts"],
+                         "sequence_lengths_sha256": checksum,
+                     })
+
+
+ORIGINAL_CASES = ("1k", "8k", "128k", "1kx8", "1kx128")
+VARIABLE_LENGTH_CASES = tuple(VARIABLE_LENGTH_SPECS)
 
 CASES: dict[str, LlamaCase] = {
     "1k": LlamaCase(num_seqs=1, seq_len=1024, strategy="sequence_sharded"),
@@ -51,6 +134,15 @@ CASES: dict[str, LlamaCase] = {
     "128k": LlamaCase(num_seqs=1, seq_len=131072, strategy="sequence_sharded"),
     "1kx8": LlamaCase(num_seqs=8, seq_len=1024, strategy="batch_sharded"),
     "1kx128": LlamaCase(num_seqs=128, seq_len=1024, strategy="batch_sharded"),
+    **{name: make_variable_length_case(name) for name in VARIABLE_LENGTH_CASES},
+}
+
+# Case groups accepted by --case in addition to individual case names. "all"
+# keeps its original meaning; the variable-length cases are opt-in, matching
+# the Einsummable setup where they have their own launchers.
+CASE_GROUPS: dict[str, tuple[str, ...]] = {
+    "all": ORIGINAL_CASES,
+    "variable-length": VARIABLE_LENGTH_CASES,
 }
 
 SDPA_OOM_RISK_CASES = frozenset({"128k", "1kx128"})
@@ -88,6 +180,9 @@ class CaseBenchmarkResult:
     peak_memory_gib: float
     output_shape: tuple[int, ...]
     reference_check: str | None = None
+    # Variable-length cases only: the exact ordered layout plus how the
+    # batch_sharded split distributed tokens and attention work over ranks.
+    sequence_pattern: dict[str, Any] | None = None
 
 
 @dataclass
@@ -107,8 +202,11 @@ def parse_args() -> argparse.Namespace:
         description="Benchmark one synthetic Llama block forward pass."
     )
     parser.add_argument("--case",
-                        choices=[*CASES.keys(), "all"],
-                        default="all")
+                        choices=[*CASES.keys(), *CASE_GROUPS.keys()],
+                        default="all",
+                        help=("A single case, 'all' for the original five "
+                              "cases, or 'variable-length' for "
+                              f"{', '.join(VARIABLE_LENGTH_CASES)}."))
     parser.add_argument("--tp-size", type=int, choices=[1, 4, 8], default=1)
     parser.add_argument(
         "--parallel-strategy",
@@ -297,54 +395,63 @@ def make_randn(shape: tuple[int, ...],
     return torch.randn(shape, device=device, dtype=dtype, generator=gen) * scale
 
 
-def make_sequence_metadata(num_seqs: int, seq_len: int, position_offset: int,
+def make_sequence_metadata(lengths: tuple[int, ...], position_offset: int,
                            device: torch.device
                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                                       torch.Tensor]:
-    positions = (
-        torch.arange(position_offset,
-                     position_offset + seq_len,
-                     device=device,
-                     dtype=torch.long).repeat(num_seqs)
-    )
-    b_start_loc = torch.arange(num_seqs, device=device,
-                               dtype=torch.int32) * seq_len
-    b_seq_len = torch.full((num_seqs, ), seq_len, device=device, dtype=torch.int32)
-    cu_seqlens = torch.arange(num_seqs + 1, device=device,
-                              dtype=torch.int32) * seq_len
+    """Packed-sequence metadata; RoPE positions restart for each sequence."""
+    b_seq_len = torch.tensor(lengths, device=device, dtype=torch.int32)
+    cu_seqlens = torch.zeros(len(lengths) + 1, device=device, dtype=torch.int32)
+    cu_seqlens[1:] = torch.cumsum(b_seq_len, dim=0)
+    b_start_loc = cu_seqlens[:-1].clone()
+    total = sum(lengths)
+    positions = (torch.arange(total, device=device, dtype=torch.long) -
+                 torch.repeat_interleave(b_start_loc.long(), b_seq_len.long(),
+                                         output_size=total) + position_offset)
     return positions, b_start_loc, b_seq_len, cu_seqlens
+
+
+def batch_shard_bounds(num_seqs: int, world_size: int, rank: int,
+                       case_name: str) -> tuple[int, int]:
+    if num_seqs % world_size != 0:
+        raise RuntimeError(
+            f"{case_name} num_seqs={num_seqs} must be divisible by "
+            f"world_size={world_size} for batch_sharded.")
+    local_num_seqs = num_seqs // world_size
+    return rank * local_num_seqs, local_num_seqs
 
 
 def make_case_inputs(case_name: str, runtime: Runtime, dtype: torch.dtype,
                      seed: int, parallel_strategy: str
                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                                torch.Tensor, torch.Tensor, int, int, int, int]:
+                                torch.Tensor, torch.Tensor, int, int, int, int,
+                                tuple[int, ...]]:
     case = CASES[case_name]
     num_seqs = case.num_seqs
     seq_len = case.seq_len
-    total_tokens = num_seqs * seq_len
-    x = make_randn((total_tokens, D),
+    lengths = case.lengths
+    x = make_randn((case.total_tokens, D),
                    device=runtime.device,
                    dtype=dtype,
                    seed=seed + 11,
                    scale=0.02)
-    local_num_seqs = num_seqs
-    local_seq_len = seq_len
+    local_lengths = lengths
     position_offset = 0
 
     if runtime.world_size > 1 and parallel_strategy == "benchmark":
-        x_3d = x.view(num_seqs, seq_len, D)
         if case.strategy == "batch_sharded":
-            if num_seqs % runtime.world_size != 0:
-                raise RuntimeError(
-                    f"{case_name} num_seqs={num_seqs} must be divisible by "
-                    f"world_size={runtime.world_size} for batch_sharded."
-                )
-            local_num_seqs = num_seqs // runtime.world_size
-            start = runtime.rank * local_num_seqs
-            x = x_3d.narrow(0, start, local_num_seqs).contiguous().view(
-                local_num_seqs * seq_len, D)
+            # Contiguous, equal-count blocks of whole sequences per rank, as
+            # for 1kx128. With variable lengths the per-rank token counts
+            # differ; no balancing is applied.
+            start, local_num_seqs = batch_shard_bounds(
+                num_seqs, runtime.world_size, runtime.rank, case_name)
+            local_lengths = lengths[start:start + local_num_seqs]
+            token_start = sum(lengths[:start])
+            x = x.narrow(0, token_start, sum(local_lengths)).contiguous()
         else:
+            if case.sequence_lengths is not None:
+                raise RuntimeError(
+                    f"{case_name}: sequence_sharded needs equal lengths.")
             if seq_len % runtime.world_size != 0:
                 raise RuntimeError(
                     f"{case_name} seq_len={seq_len} must be divisible by "
@@ -352,13 +459,16 @@ def make_case_inputs(case_name: str, runtime: Runtime, dtype: torch.dtype,
                 )
             local_seq_len = seq_len // runtime.world_size
             position_offset = runtime.rank * local_seq_len
+            x_3d = x.view(num_seqs, seq_len, D)
             x = x_3d.narrow(1, position_offset, local_seq_len).contiguous().view(
                 num_seqs * local_seq_len, D)
+            local_lengths = (local_seq_len, ) * num_seqs
 
     positions, b_start_loc, b_seq_len, cu_seqlens = make_sequence_metadata(
-        local_num_seqs, local_seq_len, position_offset, runtime.device)
-    return (x, positions, b_start_loc, b_seq_len, cu_seqlens, local_num_seqs,
-            local_seq_len, num_seqs, seq_len)
+        local_lengths, position_offset, runtime.device)
+    return (x, positions, b_start_loc, b_seq_len, cu_seqlens,
+            len(local_lengths), max(local_lengths), num_seqs, seq_len,
+            local_lengths)
 
 
 def make_weights(runtime: Runtime, dtype: torch.dtype, parallel_strategy: str,
@@ -549,15 +659,32 @@ def attention_sdpa_sequence_sharded(q: torch.Tensor, k: torch.Tensor,
                                            HEAD_DIM)
 
 
+def attention_sdpa_varlen(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                          lengths: tuple[int, ...]) -> torch.Tensor:
+    # SDPA has no packed variable-length input, so run it per sequence. A
+    # block-diagonal mask over all tokens would not fit in memory.
+    out = torch.empty_like(q)
+    start = 0
+    for length in lengths:
+        end = start + length
+        out[start:end] = attention_sdpa(q[start:end], k[start:end],
+                                        v[start:end], 1, length)
+        start = end
+    return out
+
+
 def packed_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                      b_start_loc: torch.Tensor, b_seq_len: torch.Tensor,
                      cu_seqlens: torch.Tensor, num_seqs: int, seq_len: int,
-                     backend: str) -> torch.Tensor:
+                     lengths: tuple[int, ...], backend: str) -> torch.Tensor:
+    # seq_len is the maximum local sequence length.
     if backend == "triton-prefill":
         return attention_triton_prefill(q, k, v, b_start_loc, b_seq_len, seq_len)
     if backend == "flash-attn-varlen":
         return attention_flash_varlen(q, k, v, cu_seqlens, seq_len)
     if backend == "sdpa":
+        if len(set(lengths)) > 1:
+            return attention_sdpa_varlen(q, k, v, lengths)
         return attention_sdpa(q, k, v, num_seqs, seq_len)
     raise ValueError(f"Unsupported attention backend: {backend}")
 
@@ -566,6 +693,7 @@ def llama_block_forward(x: torch.Tensor, positions: torch.Tensor,
                         b_start_loc: torch.Tensor, b_seq_len: torch.Tensor,
                         cu_seqlens: torch.Tensor, cos_cache: torch.Tensor,
                         sin_cache: torch.Tensor, num_seqs: int, seq_len: int,
+                        local_lengths: tuple[int, ...],
                         global_num_seqs: int, global_seq_len: int,
                         weights: BlockWeights, runtime: Runtime, backend: str,
                         case_strategy: str, parallel_strategy: str
@@ -590,7 +718,8 @@ def llama_block_forward(x: torch.Tensor, positions: torch.Tensor,
                                                    query_offset)
     else:
         attn_ctx = packed_attention(q_r, k_r, v_3d, b_start_loc, b_seq_len,
-                                    cu_seqlens, num_seqs, seq_len, backend)
+                                    cu_seqlens, num_seqs, seq_len,
+                                    local_lengths, backend)
     attn_out_partial = torch.einsum("shm,hmd->sd", attn_ctx, weights.wo)
     attn_out = (all_reduce_sum(attn_out_partial, runtime)
                 if parallel_strategy == "tensor-parallel" else attn_out_partial)
@@ -612,6 +741,33 @@ def synchronize(runtime: Runtime) -> None:
     torch.cuda.synchronize(runtime.device)
     if runtime.is_distributed:
         dist.barrier()
+
+
+def sequence_pattern_record(case: LlamaCase, case_name: str, runtime: Runtime,
+                            parallel_strategy: str) -> dict[str, Any] | None:
+    if case.sequence_pattern is None:
+        return None
+    lengths = list(case.lengths)
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    if parallel_strategy == "benchmark":
+        _, per_rank = batch_shard_bounds(case.num_seqs, runtime.world_size, 0,
+                                         case_name)
+        shards = [lengths[r * per_rank:(r + 1) * per_rank]
+                  for r in range(runtime.world_size)]
+    else:
+        shards = [lengths]
+    return {
+        **case.sequence_pattern,
+        "sequence_lengths": lengths,
+        "cu_seqlens_with_zero": cu,
+        "max_sequence_length": max(lengths),
+        "attention_work_proxy_sum_squared_lengths": sum(n * n for n in lengths),
+        "per_rank_num_seqs": [len(s) for s in shards],
+        "per_rank_tokens": [sum(s) for s in shards],
+        "per_rank_attention_work_proxy": [sum(n * n for n in s) for s in shards],
+    }
 
 
 def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
@@ -637,19 +793,20 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
         )
 
     (x, positions, b_start_loc, b_seq_len, cu_seqlens, num_seqs, seq_len,
-     global_num_seqs, global_seq_len) = make_case_inputs(
+     global_num_seqs, global_seq_len, local_lengths) = make_case_inputs(
          case_name, runtime, dtype, args.seed, args.parallel_strategy)
     cos_cache, sin_cache = rope_cache(global_seq_len, runtime.device, dtype)
     weights, _, _, _ = make_weights(runtime, dtype, args.parallel_strategy,
                                     args.seed)
-    total_tokens = global_num_seqs * global_seq_len
-    local_tokens = num_seqs * seq_len
+    total_tokens = case.total_tokens
+    local_tokens = x.shape[0]
 
     def run_once(selected_backend: str) -> torch.Tensor:
         return llama_block_forward(x, positions, b_start_loc, b_seq_len,
                                    cu_seqlens, cos_cache, sin_cache,
-                                   num_seqs, seq_len, global_num_seqs,
-                                   global_seq_len, weights, runtime,
+                                   num_seqs, seq_len, local_lengths,
+                                   global_num_seqs, global_seq_len,
+                                   weights, runtime,
                                    selected_backend, case.strategy,
                                    args.parallel_strategy)
 
@@ -721,6 +878,8 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
         peak_memory_gib=peak_gib,
         output_shape=tuple(output.shape),
         reference_check=reference_check,
+        sequence_pattern=sequence_pattern_record(case, case_name, runtime,
+                                                 args.parallel_strategy),
     )
 
     rank0_print(
@@ -744,6 +903,9 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
             f"tokens_per_second={tok_per_s:.2f}",
             f"peak_memory_gib={peak_gib:.2f}",
             f"output_shape={tuple(output.shape)}",
+            *([f"sequence_lengths_sha256="
+               f"{result.sequence_pattern['sequence_lengths_sha256']}"]
+              if result.sequence_pattern else []),
         ]),
     )
 
@@ -804,7 +966,7 @@ def main() -> None:
         ]),
     )
 
-    case_names = list(CASES) if args.case == "all" else [args.case]
+    case_names = list(CASE_GROUPS.get(args.case, (args.case, )))
     case_results: list[CaseBenchmarkResult] = []
     try:
         for case_name in case_names:

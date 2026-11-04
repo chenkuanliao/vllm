@@ -34,5 +34,5 @@ fi
 results_json_path() {
   local tp_size="$1"
   mkdir -p results
-  echo "results/tp${tp_size}_$(date -u +%Y%m%dT%H%M%SZ).json"
+  echo "results/${RESULTS_TAG:+${RESULTS_TAG}_}tp${tp_size}_$(date -u +%Y%m%dT%H%M%SZ).json"
 }

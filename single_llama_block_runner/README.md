@@ -130,6 +130,15 @@ independent packed 1024-token causal sequences, not one 131072-token sequence.
 Both `128k` and `1kx128` use 131072 total tokens but different sharding
 strategies.
 
+Opt-in variable-length cases (not part of `--case all`):
+
+| Case | Lengths x count | Sequences | Total tokens |
+|---|---|---:|---:|
+| `var-moderate-128` | 512 x 32, 768 x 32, 1280 x 32, 1536 x 32 | 128 | 131072 |
+| `var-strong-128` | 256 x 96, 1536 x 16, 5120 x 16 | 128 | 131072 |
+
+See [Variable-Length Cases](#variable-length-cases).
+
 ## Distributed Strategies
 
 Default `--parallel-strategy benchmark` matches the benchmark directory:
@@ -141,6 +150,8 @@ Default `--parallel-strategy benchmark` matches the benchmark directory:
 | `128k` | `sequence_sharded` | Same as `8k`, with a 131072-token global sequence. |
 | `1kx8` | `batch_sharded` | Split independent packed sequences across ranks and run local packed causal attention. |
 | `1kx128` | `batch_sharded` | Same as `1kx8`, with more local sequences per rank. |
+| `var-moderate-128` | `batch_sharded` | Same as `1kx128`: 128 / N whole sequences per rank. Per-rank token counts differ. |
+| `var-strong-128` | `batch_sharded` | Same as `var-moderate-128`. |
 
 Batch-sharded cases keep using the selected packed vLLM attention backend on
 each rank. Sequence-sharded cases need an offset-aware causal mask after K/V
@@ -173,6 +184,51 @@ Run all launch sizes in order:
 ```
 
 The launch scripts resolve Python and `torchrun` automatically via `env.sh`.
+
+## Variable-Length Cases
+
+`var-moderate-128` and `var-strong-128` match the Einsummable experiments of
+the same name (`experiements/variable_length/` on the vldb-experiments
+branch). Each keeps `1kx128`'s 128-sequence / 131072-token budget and varies
+the sequence lengths. Run them at 1, 4, and 8 GPUs on V100 or A100 with:
+
+```bash
+./run_variable_length.sh
+./run_variable_length.sh --case var-strong-128   # one case only
+./run_4gpu.sh --case variable-length             # one GPU count only
+```
+
+Results go to `results/variable_length_tp{1,4,8}_<timestamp>.json`.
+
+**Same layout as Einsummable.** The ordered lengths are generated with
+Einsummable's `sha256-sort-v1` recipe (seed 42): expand the length histogram
+in order, then sort index `i` by `SHA256("42:i")`. No library RNG is used.
+At import, `run_block.py` checks the result against the checksum Einsummable
+writes to every `sequence_pattern.json` (`sequence_lengths_sha256`: SHA256 of
+the JSON length array with no spaces) and refuses to run on a mismatch:
+
+| Case | `sequence_lengths_sha256` |
+|---|---|
+| `var-moderate-128` | `98788f83854bfb6ff2b6e5fedf6661ef3781bbd086b5f18e186447357edd8cba` |
+| `var-strong-128` | `b1206b5a6e85f731b6554817dd9dc7750727586e118db04966901adcb8c8b222` |
+
+Inputs are one packed buffer with those boundaries. RoPE positions restart at
+zero for each sequence, and attention is causal within each sequence. Nothing
+is padded to the maximum length.
+
+**Distribution and kernels (no tuning).** These cases use the same
+`batch_sharded` strategy as `1kx128`: rank `r` gets sequences
+`[r * 128/N, (r+1) * 128/N)` in pattern order. Ranks therefore get different
+token counts and attention work; no balancing is applied. Attention uses the
+default backend: vLLM's FlashAttention-2 varlen kernel on A100 and PyTorch
+SDPA on V100. SDPA has no packed variable-length input, so the runner calls it
+once per sequence.
+
+Each case's JSON entry has a `sequence_pattern` record with the ordered
+`sequence_lengths`, `cu_seqlens_with_zero`, the checksum, and
+`per_rank_num_seqs`, `per_rank_tokens`, and `per_rank_attention_work_proxy`
+(sum of squared lengths). For these cases `seq_len` and `local_seq_len` are the
+maximum (local) sequence length.
 
 ## Direct Commands
 
@@ -239,7 +295,7 @@ out of memory.
 
 ```bash
 python run_block.py \
-  --case {1k,8k,128k,1kx8,1kx128,all} \
+  --case {1k,8k,128k,1kx8,1kx128,var-moderate-128,var-strong-128,all,variable-length} \
   --tp-size {1,4,8} \
   --parallel-strategy {benchmark,tensor-parallel} \
   --dtype {auto,float16,bfloat16,float32} \
