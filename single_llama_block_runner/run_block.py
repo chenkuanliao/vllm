@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import statistics
 import sys
@@ -180,6 +179,13 @@ class CaseBenchmarkResult:
     peak_memory_gib: float
     output_shape: tuple[int, ...]
     reference_check: str | None = None
+    # How the timed forwards ran: "cuda_graph" replay, or "eager" only when
+    # capture is not supported (capture_error says why).
+    execution: str = "cuda_graph"
+    capture_warmups: int = 0
+    warmup_capture_ms: float = 0.0
+    warmup_forward_ms: list[float] | None = None
+    capture_error: str | None = None
     # Variable-length cases only: the exact ordered layout plus how the
     # batch_sharded split distributed tokens and attention work over ranks.
     sequence_pattern: dict[str, Any] | None = None
@@ -231,8 +237,13 @@ def parse_args() -> argparse.Namespace:
                         ],
                         default="auto")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--warmup-iters", type=int, default=5)
-    parser.add_argument("--benchmark-iters", type=int, default=20)
+    parser.add_argument("--warmup-iters", type=int, default=2,
+                        help="Timed CUDA graph replays excluded from stats.")
+    parser.add_argument("--benchmark-iters", type=int, default=10)
+    parser.add_argument(
+        "--capture-warmups", type=int, default=1,
+        help="Untimed eager forwards before CUDA graph capture (lazy init, "
+        "Triton JIT, NCCL communicators).")
     parser.add_argument("--check-reference", action="store_true")
     parser.add_argument(
         "--output-json",
@@ -384,15 +395,23 @@ def all_gather_sequence_heads(local: torch.Tensor, runtime: Runtime,
                                               local.shape[1], local.shape[2])
 
 
-def make_randn(shape: tuple[int, ...],
-               *,
-               device: torch.device,
-               dtype: torch.dtype,
-               seed: int,
-               scale: float) -> torch.Tensor:
+# Same input ranges as Einsummable's experiements/workloads.py (uniform fill).
+X_RANGE = (-0.1, 0.1)
+GAMMA_RANGE = (0.9, 1.1)
+WEIGHT_RANGE = (-0.02, 0.02)
+
+
+def make_uniform(shape: tuple[int, ...],
+                 *,
+                 device: torch.device,
+                 dtype: torch.dtype,
+                 seed: int,
+                 value_range: tuple[float, float]) -> torch.Tensor:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
-    return torch.randn(shape, device=device, dtype=dtype, generator=gen) * scale
+    low, high = value_range
+    return torch.empty(shape, device=device, dtype=dtype).uniform_(
+        low, high, generator=gen)
 
 
 def make_sequence_metadata(lengths: tuple[int, ...], position_offset: int,
@@ -430,11 +449,11 @@ def make_case_inputs(case_name: str, runtime: Runtime, dtype: torch.dtype,
     num_seqs = case.num_seqs
     seq_len = case.seq_len
     lengths = case.lengths
-    x = make_randn((case.total_tokens, D),
-                   device=runtime.device,
-                   dtype=dtype,
-                   seed=seed + 11,
-                   scale=0.02)
+    x = make_uniform((case.total_tokens, D),
+                     device=runtime.device,
+                     dtype=dtype,
+                     seed=seed + 11,
+                     value_range=X_RANGE)
     local_lengths = lengths
     position_offset = 0
 
@@ -490,38 +509,46 @@ def make_weights(runtime: Runtime, dtype: torch.dtype, parallel_strategy: str,
     device = runtime.device
 
     weights = BlockWeights(
-        gam_a=torch.ones((D, ), device=device, dtype=dtype),
-        gam_f=torch.ones((D, ), device=device, dtype=dtype),
-        wq=make_randn((D, q_heads_local, HEAD_DIM),
-                      device=device,
-                      dtype=dtype,
-                      seed=shard_seed + 1,
-                      scale=1.0 / math.sqrt(D)),
-        wk=make_randn((D, kv_heads_local, HEAD_DIM),
-                      device=device,
-                      dtype=dtype,
-                      seed=shard_seed + 2,
-                      scale=1.0 / math.sqrt(D)),
-        wv=make_randn((D, kv_heads_local, HEAD_DIM),
-                      device=device,
-                      dtype=dtype,
-                      seed=shard_seed + 3,
-                      scale=1.0 / math.sqrt(D)),
-        wo=make_randn((q_heads_local, HEAD_DIM, D),
-                      device=device,
-                      dtype=dtype,
-                      seed=shard_seed + 4,
-                      scale=1.0 / math.sqrt(N_Q_HEADS * HEAD_DIM)),
-        w_gu=make_randn((D, 2 * ffn_inter_local),
+        gam_a=make_uniform((D, ),
+                           device=device,
+                           dtype=dtype,
+                           seed=seed + 100000 - 2,
+                           value_range=GAMMA_RANGE),
+        gam_f=make_uniform((D, ),
+                           device=device,
+                           dtype=dtype,
+                           seed=seed + 100000 - 1,
+                           value_range=GAMMA_RANGE),
+        wq=make_uniform((D, q_heads_local, HEAD_DIM),
                         device=device,
                         dtype=dtype,
-                        seed=shard_seed + 5,
-                        scale=1.0 / math.sqrt(D)),
-        w_down=make_randn((ffn_inter_local, D),
+                        seed=shard_seed + 1,
+                        value_range=WEIGHT_RANGE),
+        wk=make_uniform((D, kv_heads_local, HEAD_DIM),
+                        device=device,
+                        dtype=dtype,
+                        seed=shard_seed + 2,
+                        value_range=WEIGHT_RANGE),
+        wv=make_uniform((D, kv_heads_local, HEAD_DIM),
+                        device=device,
+                        dtype=dtype,
+                        seed=shard_seed + 3,
+                        value_range=WEIGHT_RANGE),
+        wo=make_uniform((q_heads_local, HEAD_DIM, D),
+                        device=device,
+                        dtype=dtype,
+                        seed=shard_seed + 4,
+                        value_range=WEIGHT_RANGE),
+        w_gu=make_uniform((D, 2 * ffn_inter_local),
                           device=device,
                           dtype=dtype,
-                          seed=shard_seed + 6,
-                          scale=1.0 / math.sqrt(FFN_INTER)),
+                          seed=shard_seed + 5,
+                          value_range=WEIGHT_RANGE),
+        w_down=make_uniform((ffn_inter_local, D),
+                            device=device,
+                            dtype=dtype,
+                            seed=shard_seed + 6,
+                            value_range=WEIGHT_RANGE),
     )
     return weights, q_heads_local, kv_heads_local, ffn_inter_local
 
@@ -623,38 +650,65 @@ def attention_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return out.permute(0, 2, 1, 3).reshape(num_seqs * seq_len, q_heads, HEAD_DIM)
 
 
-def attention_sdpa_sequence_sharded(q: torch.Tensor, k: torch.Tensor,
-                                    v: torch.Tensor, num_seqs: int,
-                                    local_seq_len: int, full_seq_len: int,
-                                    query_offset: int) -> torch.Tensor:
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+def attention_sequence_sharded(q: torch.Tensor, k: torch.Tensor,
+                               v: torch.Tensor, num_seqs: int,
+                               local_seq_len: int, full_seq_len: int,
+                               query_offset: int,
+                               backend: str) -> torch.Tensor:
+    """Causal attention for one rank's query chunk against gathered K/V.
+
+    Keys after this rank's last query position are always masked, so they are
+    dropped. What remains is ordinary causal attention aligned to the
+    bottom-right corner of the (local_q x kept_k) score matrix, which flash
+    kernels support directly (no explicit mask).
+    """
     q_heads = q.shape[1]
     kv_heads = k.shape[1]
     if q_heads % kv_heads != 0:
         raise RuntimeError(
             f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}.")
+    kept = query_offset + local_seq_len
+    k4 = k.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM)[:, :kept]
+    v4 = v.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM)[:, :kept]
 
-    q4 = q.view(num_seqs, local_seq_len, q_heads, HEAD_DIM).permute(0, 2, 1, 3)
-    k4 = k.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM).permute(0, 2, 1, 3)
-    v4 = v.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM).permute(0, 2, 1, 3)
+    if backend == "flash-attn-varlen":
+        # FA2 aligns the causal mask bottom-right when seqlen_q < seqlen_k.
+        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+        seq_idx = torch.arange(num_seqs + 1, device=q.device,
+                               dtype=torch.int32)
+        out = flash_attn_varlen_func(
+            q=q.contiguous(),
+            k=k4.reshape(num_seqs * kept, kv_heads, HEAD_DIM),
+            v=v4.reshape(num_seqs * kept, kv_heads, HEAD_DIM),
+            cu_seqlens_q=seq_idx * local_seq_len,
+            cu_seqlens_k=seq_idx * kept,
+            max_seqlen_q=local_seq_len,
+            max_seqlen_k=kept,
+            dropout_p=0.0,
+            softmax_scale=HEAD_DIM**-0.5,
+            causal=True,
+            fa_version=2,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        return out
+
+    # SDPA (V100): its fused kernels need equal head counts, so expand K/V
+    # after the gather.
+    from torch.nn.attention.bias import causal_lower_right
+
+    q4 = q.contiguous().view(num_seqs, local_seq_len, q_heads,
+                             HEAD_DIM).permute(0, 2, 1, 3)
+    k4 = k4.permute(0, 2, 1, 3)
+    v4 = v4.permute(0, 2, 1, 3)
     repeat = q_heads // kv_heads
     if repeat != 1:
         k4 = k4.repeat_interleave(repeat, dim=1)
         v4 = v4.repeat_interleave(repeat, dim=1)
-
-    q_pos = torch.arange(query_offset,
-                         query_offset + local_seq_len,
-                         device=q.device)[:, None]
-    k_pos = torch.arange(full_seq_len, device=q.device)[None, :]
-    attn_mask = (k_pos <= q_pos)[None, None, :, :]
-    out = F.scaled_dot_product_attention(q4,
-                                          k4,
-                                          v4,
-                                          attn_mask=attn_mask,
-                                          dropout_p=0.0,
-                                          is_causal=False)
+    out = F.scaled_dot_product_attention(
+        q4, k4.contiguous(), v4.contiguous(),
+        attn_mask=causal_lower_right(local_seq_len, kept), dropout_p=0.0)
     return out.permute(0, 2, 1, 3).reshape(num_seqs * local_seq_len, q_heads,
                                            HEAD_DIM)
 
@@ -712,10 +766,10 @@ def llama_block_forward(x: torch.Tensor, positions: torch.Tensor,
         k_full = all_gather_sequence_heads(k_r, runtime, global_num_seqs)
         v_full = all_gather_sequence_heads(v_3d, runtime, global_num_seqs)
         query_offset = runtime.rank * seq_len
-        attn_ctx = attention_sdpa_sequence_sharded(q_r, k_full, v_full,
-                                                   global_num_seqs, seq_len,
-                                                   global_seq_len,
-                                                   query_offset)
+        attn_ctx = attention_sequence_sharded(q_r, k_full, v_full,
+                                              global_num_seqs, seq_len,
+                                              global_seq_len, query_offset,
+                                              backend)
     else:
         attn_ctx = packed_attention(q_r, k_r, v_3d, b_start_loc, b_seq_len,
                                     cu_seqlens, num_seqs, seq_len,
@@ -741,6 +795,88 @@ def synchronize(runtime: Runtime) -> None:
     torch.cuda.synchronize(runtime.device)
     if runtime.is_distributed:
         dist.barrier()
+
+
+def max_over_ranks(value: float, runtime: Runtime) -> float:
+    if not runtime.is_distributed:
+        return value
+    tensor = torch.tensor([value], device=runtime.device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def all_ranks_true(flag: bool, runtime: Runtime) -> bool:
+    if not runtime.is_distributed:
+        return flag
+    tensor = torch.tensor([1 if flag else 0], device=runtime.device,
+                          dtype=torch.int32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+    return bool(tensor.item())
+
+
+def elapsed_ms(work, runtime: Runtime) -> float:
+    """Host wall time of one step: all ranks start together (sync + barrier),
+    each times until its own device is idle, and the slowest rank counts."""
+    synchronize(runtime)
+    start = time.perf_counter()
+    work()
+    torch.cuda.synchronize(runtime.device)
+    return max_over_ranks((time.perf_counter() - start) * 1000.0, runtime)
+
+
+def capture_forward(step, runtime: Runtime, capture_warmups: int
+                    ) -> tuple[Any, torch.Tensor, dict[str, Any],
+                               torch.cuda.CUDAGraph | None]:
+    """Untimed eager warmups, then capture `step` in a CUDA graph.
+
+    Returns the callable to time (graph replay; eager `step` only if capture is
+    not supported), its output tensor, a record of what was done, and the graph.
+    Mirrors Einsummable's untimed first execution (eager warmup + capture).
+    """
+    device = runtime.device
+    synchronize(runtime)
+    start = time.perf_counter()
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        for _ in range(capture_warmups):
+            step()
+    torch.cuda.current_stream(device).wait_stream(side)
+    torch.cuda.synchronize(device)
+    # Return eager-warmup blocks so the graph's private pool can reuse them.
+    torch.cuda.empty_cache()
+    synchronize(runtime)
+    graph = torch.cuda.CUDAGraph()
+    output = None
+    error = None
+    try:
+        with torch.cuda.graph(graph):
+            output = step()
+    except Exception as exc:  # noqa: BLE001 - unsupported; fall back to eager
+        error = f"{type(exc).__name__}: {exc}"
+    torch.cuda.synchronize(device)
+    captured = all_ranks_true(error is None, runtime)
+    if captured:
+        graph.replay()
+    else:
+        graph.reset()
+        graph = None
+        torch.cuda.empty_cache()
+        output = step()
+    torch.cuda.synchronize(device)
+    record = {
+        "execution": "cuda_graph" if captured else "eager",
+        "capture_warmups": capture_warmups,
+        "warmup_capture_ms": max_over_ranks(
+            (time.perf_counter() - start) * 1000.0, runtime),
+        "capture_error": None if captured else (
+            error or "capture failed on another rank"),
+    }
+    if not captured:
+        rank0_print(runtime,
+                    f"warning: CUDA graph capture unsupported, timing eager: "
+                    f"{record['capture_error']}")
+    return (graph.replay if captured else step), output, record, graph
 
 
 def sequence_pattern_record(case: LlamaCase, case_name: str, runtime: Runtime,
@@ -783,13 +919,15 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
 
     effective_backend = backend
     if (args.parallel_strategy == "benchmark" and runtime.world_size > 1
-            and case.strategy == "sequence_sharded"):
+            and case.strategy == "sequence_sharded"
+            and backend == "triton-prefill"):
+        # The Triton prefill kernel has no query offset; use SDPA with a
+        # bottom-right causal mask instead.
         effective_backend = "sdpa"
-    if effective_backend != backend:
         rank0_print(
             runtime,
             f"case={case_name} strategy=sequence_sharded uses sdpa attention "
-            "for offset-aware causal masking after K/V gather.",
+            "(triton-prefill has no query offset).",
         )
 
     (x, positions, b_start_loc, b_seq_len, cu_seqlens, num_seqs, seq_len,
@@ -811,19 +949,17 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
                                    args.parallel_strategy)
 
     with torch.inference_mode():
-        output = None
-        for _ in range(args.warmup_iters):
-            output = run_once(effective_backend)
-        synchronize(runtime)
-
+        # Reset before the eager warmup so the peak covers the activations; the
+        # graph's private pool is not re-allocated during replay.
         torch.cuda.reset_peak_memory_stats(runtime.device)
-        forward_ms: list[float] = []
-        for _ in range(args.benchmark_iters):
-            synchronize(runtime)
-            start = time.perf_counter()
-            output = run_once(effective_backend)
-            synchronize(runtime)
-            forward_ms.append((time.perf_counter() - start) * 1000.0)
+        run, output, execution, graph = capture_forward(
+            lambda: run_once(effective_backend), runtime, args.capture_warmups)
+        warmup_forward_ms = [
+            elapsed_ms(run, runtime) for _ in range(args.warmup_iters)
+        ]
+        forward_ms = [
+            elapsed_ms(run, runtime) for _ in range(args.benchmark_iters)
+        ]
 
         assert output is not None
         mean_ms = statistics.mean(forward_ms)
@@ -878,6 +1014,8 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
         peak_memory_gib=peak_gib,
         output_shape=tuple(output.shape),
         reference_check=reference_check,
+        warmup_forward_ms=warmup_forward_ms,
+        **execution,
         sequence_pattern=sequence_pattern_record(case, case_name, runtime,
                                                  args.parallel_strategy),
     )
@@ -896,6 +1034,7 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
             f"total_tokens={total_tokens}",
             f"local_tokens={local_tokens}",
             f"attention_backend={effective_backend}",
+            f"execution={execution['execution']}",
             f"mean_forward_ms={mean_ms:.3f}",
             f"std_forward_ms={std_ms:.3f}",
             f"min_forward_ms={min_ms:.3f}",
@@ -910,7 +1049,10 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
     )
 
     del x, positions, b_start_loc, b_seq_len, cu_seqlens, cos_cache, sin_cache
-    del weights, output
+    del weights, output, run
+    if graph is not None:
+        graph.reset()
+    del graph
     torch.cuda.empty_cache()
     return result
 
@@ -943,6 +1085,13 @@ def build_results_payload(
         "seed": args.seed,
         "warmup_iters": args.warmup_iters,
         "benchmark_iters": args.benchmark_iters,
+        "capture_warmups": args.capture_warmups,
+        "timing": ("host wall time per step; sync + barrier before, device "
+                   "sync after; max over ranks; CUDA graph replay"),
+        "input_init": ("uniform: x [-0.1, 0.1], gamma [0.9, 1.1], "
+                       "weights [-0.02, 0.02]"),
+        "fp16_reduced_precision_reduction": (
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction),
         "check_reference": args.check_reference,
         "cases": [asdict(result) for result in case_results],
     }
@@ -951,6 +1100,11 @@ def build_results_payload(
 def main() -> None:
     args = parse_args()
     runtime = setup_runtime(args.tp_size)
+    # Match Einsummable's cuBLAS setup: FP16 GEMMs accumulate in FP32
+    # (CUBLAS_COMPUTE_32F), and reduced-precision split-K reductions stay
+    # allowed (its handle never sets
+    # CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION). PyTorch's default.
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     dtype = resolve_dtype(args.dtype, runtime)
     backend = resolve_attention_backend(args.attention_backend, runtime)
 

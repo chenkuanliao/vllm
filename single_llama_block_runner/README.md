@@ -154,9 +154,13 @@ Default `--parallel-strategy benchmark` matches the benchmark directory:
 | `var-strong-128` | `batch_sharded` | Same as `var-moderate-128`. |
 
 Batch-sharded cases keep using the selected packed vLLM attention backend on
-each rank. Sequence-sharded cases need an offset-aware causal mask after K/V
-gather; the runner uses SDPA for that attention step and reports it as the
-per-case effective `attention_backend`.
+each rank. In sequence-sharded cases each rank all-gathers K/V, keeps only the
+keys up to its last query position, and runs ordinary causal attention aligned
+to the bottom-right of the (local queries x kept keys) score matrix. This is
+exact and needs no explicit mask, so `flash-attn-varlen` (A100) handles it
+directly; `sdpa` (V100) uses `causal_lower_right`. `triton-prefill` has no
+query offset, so those cases fall back to SDPA and report it as the per-case
+effective `attention_backend`.
 
 Legacy tensor-parallel mode shards Q/K/V heads and FFN intermediate weights,
 keeps full inputs on every rank, and all-reduces the output projection and FFN
@@ -301,10 +305,30 @@ python run_block.py \
   --dtype {auto,float16,bfloat16,float32} \
   --attention-backend {auto,triton-prefill,flash-attn-varlen,sdpa} \
   --seed 0 \
-  --warmup-iters 5 \
-  --benchmark-iters 20 \
+  --capture-warmups 1 \
+  --warmup-iters 2 \
+  --benchmark-iters 10 \
   --output-json results/custom.json
 ```
+
+## Timing, Inputs, and Precision
+
+These match the Einsummable Llama experiments (`experiements/worker.py`) and the
+`benchmarks/jax-llama` / `benchmarks/pytorch-llama` runners:
+
+- Each case runs `--capture-warmups` (default 1) untimed eager forwards on a
+  side stream, then captures the forward in a CUDA graph and launches it once
+  (recorded as `warmup_capture_ms`). NCCL collectives are captured too.
+- `--warmup-iters` (default 2) graph replays are timed and recorded in
+  `warmup_forward_ms` but excluded from the stats; `--benchmark-iters`
+  (default 10) replays are measured.
+- Each step is host wall time: device sync + barrier before the step, timed
+  until the local device is idle, and the slowest rank's time is reported.
+- If capture is not supported for a case, `execution` is `eager` and
+  `capture_error` says why; otherwise `execution` is `cuda_graph`.
+- Inputs are uniform with Einsummable's ranges: `x` in [-0.1, 0.1], RMSNorm
+  gammas in [0.9, 1.1], weights in [-0.02, 0.02]. FP16 GEMMs accumulate in
+  FP32; RMSNorm computes in FP32.
 
 ## Output
 
@@ -329,6 +353,7 @@ Each JSON file includes run metadata (GPU, dtype, requested backend, parallel
 strategy, iteration counts) and per-case stats: strategy, effective attention
 backend, global/local shape, every benchmark iteration time in `forward_ms`, plus
 `mean_forward_ms`, `std_forward_ms`, `min_forward_ms`, `max_forward_ms`,
+`execution`, `warmup_capture_ms`, `warmup_forward_ms`,
 `tokens_per_second`, `peak_memory_gib`, and `output_shape`.
 
 ## Model Shape
