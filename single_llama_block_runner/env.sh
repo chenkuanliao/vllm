@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Resolve Python/torchrun from repo-root .venv, conda vllm env, or PATH.
+# Resolve Python/torchrun from this repository's conda env (created by
+# ./setup_env.sh v100|a100), or from PATH as a fallback.
 
-VLLM_CONDA_ENV="${VLLM_CONDA_ENV:-vllm-py312}"
+VLLM_CONDA_ENV="${VLLM_CONDA_ENV:-vllm-experiments}"
 
 resolve_conda_env_bin() {
   local exe="$1"
@@ -20,13 +21,12 @@ resolve_conda_env_bin() {
   return 1
 }
 
-if [[ -x "../.venv/bin/python" ]]; then
-  PYTHON="../.venv/bin/python"
-  TORCHRUN="../.venv/bin/torchrun"
-elif conda_python="$(resolve_conda_env_bin python)"; then
+if conda_python="$(resolve_conda_env_bin python)"; then
   PYTHON="$conda_python"
   TORCHRUN="$(resolve_conda_env_bin torchrun || echo torchrun)"
 else
+  echo "warning: conda env $VLLM_CONDA_ENV not found; run ./setup_env.sh v100|a100." \
+    "Falling back to python/torchrun on PATH." >&2
   PYTHON="${PYTHON:-python}"
   TORCHRUN="${TORCHRUN:-torchrun}"
 fi

@@ -15,102 +15,29 @@ synthetic mode is still available with `--parallel-strategy tensor-parallel`.
 
 ## Environment Setup
 
-Install vLLM from the repo root with either a uv virtualenv or the
-`vllm-py312` conda environment. The launch scripts prefer `../.venv` when
-present, otherwise the `vllm-py312` conda env (override with `VLLM_CONDA_ENV`),
-otherwise `python`/`torchrun` from `PATH`.
-
-uv virtualenv:
+This repository uses one conda env, `vllm-experiments`, created or updated by
+`setup_env.sh` for the GPU type of the machine:
 
 ```bash
-cd /path/to/vllm
-
-uv venv --python 3.12
-source .venv/bin/activate
-
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-```
-
-Conda on V100 (this machine):
-
-PyTorch 2.11 does not ship CUDA kernels for Tesla V100 (compute capability
-7.0). Use torch 2.6+cu124 and let the runner default to the SDPA attention
-backend:
-
-```bash
-cd /path/to/vllm
-
-conda create -n vllm-py312 python=3.12 -y
-conda activate vllm-py312
-
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install torch==2.6.0+cu124 torchvision torchaudio \
-  --index-url https://download.pytorch.org/whl/cu124
-```
-
-No vLLM install is required for the default V100 path (`--attention-backend
-auto` selects `sdpa`). For A100 FlashAttention-2 varlen or `triton-prefill`,
-build vLLM from source against the same torch 2.6+cu124 stack.
-
-Conda on A100 and newer (compute capability >= 8.0):
-
-```bash
-cd /path/to/vllm
-
-conda create -n vllm-py312 python=3.12 -y
-conda activate vllm-py312
-
-conda install -c conda-forge uv -y
-uv pip install --python "$CONDA_PREFIX/bin/python" --upgrade setuptools wheel
-uv pip install --python "$CONDA_PREFIX/bin/python" \
-  torch==2.11.0 torchaudio torchvision \
-  --index-url https://download.pytorch.org/whl/cu129
-VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 VLLM_USE_PRECOMPILED=1 \
-  uv pip install --python "$CONDA_PREFIX/bin/python" -e . \
-  --torch-backend=auto
-```
-
-Fresh 8xA100 setup and run:
-
-```bash
-cd /path/to/vllm
-
-conda create -n vllm-py312 python=3.12 -y
-conda activate vllm-py312
-
-conda install -c conda-forge uv -y
-uv pip install --python "$CONDA_PREFIX/bin/python" --upgrade setuptools wheel
-uv pip install --python "$CONDA_PREFIX/bin/python" \
-  torch==2.11.0 torchaudio torchvision \
-  --index-url https://download.pytorch.org/whl/cu129
-VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 VLLM_USE_PRECOMPILED=1 \
-  uv pip install --python "$CONDA_PREFIX/bin/python" -e . \
-  --torch-backend=auto
-
 cd single_llama_block_runner
+./setup_env.sh v100     # or: ./setup_env.sh a100
 ./run_all.sh
 ```
 
-`run_all.sh` runs `run_1gpu.sh`, `run_4gpu.sh`, then `run_8gpu.sh`. The full
-script therefore requires at least 8 visible A100 GPUs. If the machine has
-fewer visible GPUs, run only the matching launch script. The A100 default
-`--attention-backend auto` resolves to `flash-attn-varlen` backed by FA2, so
-the editable vLLM install above is required.
+Re-running `setup_env.sh` updates the env in place. The `run_*.sh` scripts
+find it through `env.sh` (override the name with `VLLM_CONDA_ENV`), so no
+activation is needed.
 
-The launch scripts prefer `../.venv` when present, otherwise the `vllm-py312`
-conda env (override with `VLLM_CONDA_ENV`), otherwise `python`/`torchrun`
-from `PATH`. You do not need to activate conda if `vllm-py312` exists, but
-activating it is fine:
+| GPU | What `setup_env.sh` installs |
+|---|---|
+| V100 | Python 3.12, torch 2.11.0 (CUDA 12.6 build: ships V100 sm_70 kernels, runs on the CUDA 12.4 driver). vLLM itself is not installed: the default V100 attention backend is PyTorch SDPA. |
+| A100 | Python 3.12, torch 2.11.0 (CUDA 12.9 build), and vLLM from this repository with its precompiled CUDA 12.9 kernels (`VLLM_USE_PRECOMPILED=1`), needed for the default `flash-attn-varlen` backend and for `triton-prefill`. |
 
-```bash
-conda activate vllm-py312
-cd single_llama_block_runner
-./run_1gpu.sh
-```
-
-Your NVIDIA driver must support the PyTorch CUDA build you install. If you
-previously installed `cu130` wheels on a driver that reports `CUDA Version:
-12.4`, use `cu124` on V100 or `cu129` on newer GPUs.
+torch 2.11.0 is the version this vLLM source pins (`requirements/cuda.txt`).
+The script checks the torch version and, on A100, that FlashAttention-2 varlen
+is available. `run_all.sh` runs `run_1gpu.sh`, `run_4gpu.sh`, then
+`run_8gpu.sh`, so it needs 8 visible GPUs; otherwise run only the matching
+launch script.
 
 On V100, keep the default `float16` dtype and expect `auto` to select `sdpa`.
 On A100, the default `float16` works, and `--dtype bfloat16` is optional.
@@ -136,8 +63,11 @@ Opt-in variable-length cases (not part of `--case all`):
 |---|---|---:|---:|
 | `var-moderate-128` | 512 x 32, 768 x 32, 1280 x 32, 1536 x 32 | 128 | 131072 |
 | `var-strong-128` | 256 x 96, 1536 x 16, 5120 x 16 | 128 | 131072 |
+| `var-moderate-128-sorted` | as `var-moderate-128`, sorted short to long | 128 | 131072 |
+| `var-strong-128-sorted` | as `var-strong-128`, sorted short to long | 128 | 131072 |
 
-See [Variable-Length Cases](#variable-length-cases).
+See [Variable-Length Cases](#variable-length-cases) and
+[Sorted Variable-Length Cases](#sorted-variable-length-cases).
 
 ## Distributed Strategies
 
@@ -150,7 +80,7 @@ Default `--parallel-strategy benchmark` matches the benchmark directory:
 | `128k` | `sequence_sharded` | Same as `8k`, with a 131072-token global sequence. |
 | `1kx8` | `batch_sharded` | Split independent packed sequences across ranks and run local packed causal attention. |
 | `1kx128` | `batch_sharded` | Same as `1kx8`, with more local sequences per rank. |
-| `var-moderate-128` | `batch_sharded` | Same as `1kx128`: 128 / N whole sequences per rank. Per-rank token counts differ. |
+| `var-moderate-128` | `batch_sharded` | Whole sequences per rank, split token-balanced (see below). Per-rank sequence counts differ. |
 | `var-strong-128` | `batch_sharded` | Same as `var-moderate-128`. |
 
 Batch-sharded cases keep using the selected packed vLLM attention backend on
@@ -220,10 +150,14 @@ Inputs are one packed buffer with those boundaries. RoPE positions restart at
 zero for each sequence, and attention is causal within each sequence. Nothing
 is padded to the maximum length.
 
-**Distribution and kernels (no tuning).** These cases use the same
-`batch_sharded` strategy as `1kx128`: rank `r` gets sequences
-`[r * 128/N, (r+1) * 128/N)` in pattern order. Ranks therefore get different
-token counts and attention work; no balancing is applied. Attention uses the
+**Distribution and kernels (no tuning).** These cases use `batch_sharded`
+like `1kx128`, but split token-balanced: each rank gets a contiguous run of
+whole sequences, in pattern order, ending at the sequence boundary closest to
+an equal share of tokens (ties go to the earlier boundary; every rank gets at
+least one sequence). The rule is the same as in jax-pytorch-experiments'
+`sequence_patterns.token_balanced_cuts`. Sequence counts per rank differ and
+token counts are near-equal (max/mean 1.01-1.08); attention work still
+differs, since long sequences cost more per token. Attention uses the
 default backend: vLLM's FlashAttention-2 varlen kernel on A100 and PyTorch
 SDPA on V100. SDPA has no packed variable-length input, so the runner calls it
 once per sequence.
@@ -233,6 +167,33 @@ Each case's JSON entry has a `sequence_pattern` record with the ordered
 `per_rank_num_seqs`, `per_rank_tokens`, and `per_rank_attention_work_proxy`
 (sum of squared lengths). For these cases `seq_len` and `local_seq_len` are the
 maximum (local) sequence length.
+
+## Sorted Variable-Length Cases
+
+`var-moderate-128-sorted` and `var-strong-128-sorted` match Einsummable's
+`experiements/variable_length_sorted/` setups: the same histograms as above,
+packed short to long (`length-ascending-v1`, no seed). Run them with:
+
+```bash
+./run_variable_length_sorted.sh
+./run_variable_length_sorted.sh --case var-strong-128-sorted   # one case only
+./run_4gpu.sh --case variable-length-sorted                    # one GPU count only
+```
+
+Results go to `results/variable_length_sorted_tp{1,4,8}_<timestamp>.json`.
+The checksums are verified at import as for the shuffled cases:
+
+| Case | `sequence_lengths_sha256` |
+|---|---|
+| `var-moderate-128-sorted` | `0ffa21a4e662f1466228c20111a8a369b72f3e03cd7be6f9b7b12b0415177f5c` |
+| `var-strong-128-sorted` | `c950be1808c585c308b9c74727163471481ce4812800868517fbc08625400cfa` |
+
+**Split.** The same token-balanced split as the shuffled cases. It matters
+more here: equal sequence counts would give the last ranks all the long
+sequences (up to 5x the average tokens on `var-strong-128-sorted` at 8 GPUs);
+balanced, per-rank token counts are within 1.25x of the average. The
+`sequence_pattern` record includes `split` and the per-rank counts. Everything
+else (kernels, timing, CUDA graphs) is as for the shuffled cases.
 
 ## Direct Commands
 
@@ -299,7 +260,7 @@ out of memory.
 
 ```bash
 python run_block.py \
-  --case {1k,8k,128k,1kx8,1kx128,var-moderate-128,var-strong-128,all,variable-length} \
+  --case {1k,8k,128k,1kx8,1kx128,var-moderate-128,var-strong-128,var-moderate-128-sorted,var-strong-128-sorted,all,variable-length,variable-length-sorted} \
   --tp-size {1,4,8} \
   --parallel-strategy {benchmark,tensor-parallel} \
   --dtype {auto,float16,bfloat16,float32} \

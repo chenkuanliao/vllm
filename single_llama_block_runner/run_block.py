@@ -48,6 +48,9 @@ class LlamaCase:
     # Ordered per-sequence lengths for variable-length packed cases.
     sequence_lengths: tuple[int, ...] | None = None
     sequence_pattern: dict[str, Any] | None = None
+    # How batch_sharded splits whole sequences over ranks (see
+    # batch_shard_range): "equal-count" or "token-balanced".
+    split: str = "equal-count"
 
     @property
     def lengths(self) -> tuple[int, ...]:
@@ -75,6 +78,7 @@ VARIABLE_LENGTH_SPECS: dict[str, dict[str, Any]] = {
         "total_tokens": 131072,
         "sequence_lengths_sha256":
         "98788f83854bfb6ff2b6e5fedf6661ef3781bbd086b5f18e186447357edd8cba",
+        "split": "token-balanced",
     },
     "var-strong-128": {
         "algorithm": "sha256-sort-v1",
@@ -84,6 +88,32 @@ VARIABLE_LENGTH_SPECS: dict[str, dict[str, Any]] = {
         "total_tokens": 131072,
         "sequence_lengths_sha256":
         "b1206b5a6e85f731b6554817dd9dc7750727586e118db04966901adcb8c8b222",
+        "split": "token-balanced",
+    },
+}
+
+# Sorted (short-to-long) counterparts: Einsummable's variable_length_sorted/
+# setups. Same histograms, length-ascending-v1 order. Like the shuffled cases
+# they split token-balanced; equal sequence counts would give the last ranks
+# most of the tokens.
+VARIABLE_LENGTH_SORTED_SPECS: dict[str, dict[str, Any]] = {
+    "var-moderate-128-sorted": {
+        "algorithm": "length-ascending-v1",
+        "length_counts": [[512, 32], [768, 32], [1280, 32], [1536, 32]],
+        "batch_size": 128,
+        "total_tokens": 131072,
+        "sequence_lengths_sha256":
+        "0ffa21a4e662f1466228c20111a8a369b72f3e03cd7be6f9b7b12b0415177f5c",
+        "split": "token-balanced",
+    },
+    "var-strong-128-sorted": {
+        "algorithm": "length-ascending-v1",
+        "length_counts": [[256, 96], [1536, 16], [5120, 16]],
+        "batch_size": 128,
+        "total_tokens": 131072,
+        "sequence_lengths_sha256":
+        "c950be1808c585c308b9c74727163471481ce4812800868517fbc08625400cfa",
+        "split": "token-balanced",
     },
 }
 
@@ -103,8 +133,12 @@ def sequence_lengths_sha256(lengths: list[int]) -> str:
 
 
 def make_variable_length_case(name: str) -> LlamaCase:
-    spec = VARIABLE_LENGTH_SPECS[name]
-    lengths = sha256_sort_v1(spec["seed"], spec["length_counts"])
+    spec = {**VARIABLE_LENGTH_SPECS, **VARIABLE_LENGTH_SORTED_SPECS}[name]
+    if spec["algorithm"] == "length-ascending-v1":
+        lengths = sorted(length for length, count in spec["length_counts"]
+                         for _ in range(count))
+    else:
+        lengths = sha256_sort_v1(spec["seed"], spec["length_counts"])
     checksum = sequence_lengths_sha256(lengths)
     if (len(lengths) != spec["batch_size"]
             or sum(lengths) != spec["total_tokens"]
@@ -118,14 +152,17 @@ def make_variable_length_case(name: str) -> LlamaCase:
                      sequence_lengths=tuple(lengths),
                      sequence_pattern={
                          "algorithm": spec["algorithm"],
-                         "seed": spec["seed"],
+                         **({"seed": spec["seed"]} if "seed" in spec else {}),
                          "length_counts": spec["length_counts"],
                          "sequence_lengths_sha256": checksum,
-                     })
+                         **({"split": spec["split"]} if "split" in spec else {}),
+                     },
+                     split=spec.get("split", "equal-count"))
 
 
 ORIGINAL_CASES = ("1k", "8k", "128k", "1kx8", "1kx128")
 VARIABLE_LENGTH_CASES = tuple(VARIABLE_LENGTH_SPECS)
+VARIABLE_LENGTH_SORTED_CASES = tuple(VARIABLE_LENGTH_SORTED_SPECS)
 
 CASES: dict[str, LlamaCase] = {
     "1k": LlamaCase(num_seqs=1, seq_len=1024, strategy="sequence_sharded"),
@@ -134,6 +171,8 @@ CASES: dict[str, LlamaCase] = {
     "1kx8": LlamaCase(num_seqs=8, seq_len=1024, strategy="batch_sharded"),
     "1kx128": LlamaCase(num_seqs=128, seq_len=1024, strategy="batch_sharded"),
     **{name: make_variable_length_case(name) for name in VARIABLE_LENGTH_CASES},
+    **{name: make_variable_length_case(name)
+       for name in VARIABLE_LENGTH_SORTED_CASES},
 }
 
 # Case groups accepted by --case in addition to individual case names. "all"
@@ -142,6 +181,7 @@ CASES: dict[str, LlamaCase] = {
 CASE_GROUPS: dict[str, tuple[str, ...]] = {
     "all": ORIGINAL_CASES,
     "variable-length": VARIABLE_LENGTH_CASES,
+    "variable-length-sorted": VARIABLE_LENGTH_SORTED_CASES,
 }
 
 SDPA_OOM_RISK_CASES = frozenset({"128k", "1kx128"})
@@ -212,7 +252,9 @@ def parse_args() -> argparse.Namespace:
                         default="all",
                         help=("A single case, 'all' for the original five "
                               "cases, or 'variable-length' for "
-                              f"{', '.join(VARIABLE_LENGTH_CASES)}."))
+                              f"{', '.join(VARIABLE_LENGTH_CASES)}, or "
+                              "'variable-length-sorted' for "
+                              f"{', '.join(VARIABLE_LENGTH_SORTED_CASES)}."))
     parser.add_argument("--tp-size", type=int, choices=[1, 4, 8], default=1)
     parser.add_argument(
         "--parallel-strategy",
@@ -440,6 +482,32 @@ def batch_shard_bounds(num_seqs: int, world_size: int, rank: int,
     return rank * local_num_seqs, local_num_seqs
 
 
+def token_balanced_cuts(lengths: tuple[int, ...], world_size: int) -> list[int]:
+    """Sequence indices [0, c1, ..., len]: cut i is the sequence boundary closest
+    to i/world_size of the total tokens (ties to the earlier boundary), keeping
+    at least one sequence per rank. Same rule as jax-pytorch-experiments'
+    sequence_patterns.token_balanced_cuts."""
+    cum = [0]
+    for length in lengths:
+        cum.append(cum[-1] + length)
+    total = cum[-1]
+    cuts = [0]
+    for i in range(1, world_size):
+        lo, hi = cuts[-1] + 1, len(lengths) - (world_size - i)
+        cuts.append(min(range(lo, hi + 1),
+                        key=lambda j: (abs(cum[j] * world_size - i * total), j)))
+    return cuts + [len(lengths)]
+
+
+def batch_shard_range(case: LlamaCase, world_size: int, rank: int,
+                      case_name: str) -> tuple[int, int]:
+    """(first sequence, sequence count) owned by `rank` under the case's split."""
+    if case.split == "token-balanced":
+        cuts = token_balanced_cuts(case.lengths, world_size)
+        return cuts[rank], cuts[rank + 1] - cuts[rank]
+    return batch_shard_bounds(case.num_seqs, world_size, rank, case_name)
+
+
 def make_case_inputs(case_name: str, runtime: Runtime, dtype: torch.dtype,
                      seed: int, parallel_strategy: str
                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
@@ -459,11 +527,11 @@ def make_case_inputs(case_name: str, runtime: Runtime, dtype: torch.dtype,
 
     if runtime.world_size > 1 and parallel_strategy == "benchmark":
         if case.strategy == "batch_sharded":
-            # Contiguous, equal-count blocks of whole sequences per rank, as
-            # for 1kx128. With variable lengths the per-rank token counts
-            # differ; no balancing is applied.
-            start, local_num_seqs = batch_shard_bounds(
-                num_seqs, runtime.world_size, runtime.rank, case_name)
+            # Contiguous blocks of whole sequences per rank: token-balanced
+            # for the variable-length cases, equal counts for 1kx8/1kx128
+            # (identical there, since all lengths are equal).
+            start, local_num_seqs = batch_shard_range(
+                case, runtime.world_size, runtime.rank, case_name)
             local_lengths = lengths[start:start + local_num_seqs]
             token_start = sum(lengths[:start])
             x = x.narrow(0, token_start, sum(local_lengths)).contiguous()
@@ -888,10 +956,9 @@ def sequence_pattern_record(case: LlamaCase, case_name: str, runtime: Runtime,
     for length in lengths:
         cu.append(cu[-1] + length)
     if parallel_strategy == "benchmark":
-        _, per_rank = batch_shard_bounds(case.num_seqs, runtime.world_size, 0,
-                                         case_name)
-        shards = [lengths[r * per_rank:(r + 1) * per_rank]
+        bounds = [batch_shard_range(case, runtime.world_size, r, case_name)
                   for r in range(runtime.world_size)]
+        shards = [lengths[start:start + count] for start, count in bounds]
     else:
         shards = [lengths]
     return {
@@ -1053,6 +1120,10 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
     if graph is not None:
         graph.reset()
     del graph
+    # cuBLAS per-stream workspaces come from the caching allocator; the ones
+    # made during capture sit in the graph's private pool and pin it (and a
+    # default-pool segment), so the next case would run with ~4 GiB less.
+    torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
     return result
 
