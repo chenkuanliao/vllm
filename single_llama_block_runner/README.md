@@ -84,13 +84,15 @@ Default `--parallel-strategy benchmark` matches the benchmark directory:
 | `var-strong-128` | `batch_sharded` | Same as `var-moderate-128`. |
 
 Batch-sharded cases keep using the selected packed vLLM attention backend on
-each rank. In sequence-sharded cases each rank all-gathers K/V, keeps only the
-keys up to its last query position, and runs ordinary causal attention aligned
-to the bottom-right of the (local queries x kept keys) score matrix. This is
-exact and needs no explicit mask, so `flash-attn-varlen` (A100) handles it
-directly; `sdpa` (V100) uses `causal_lower_right`. `triton-prefill` has no
-query offset, so those cases fall back to SDPA and report it as the per-case
-effective `attention_backend`.
+each rank. Sequence-sharded cases need an offset-aware causal mask after K/V
+gather; vLLM's FlashAttention-2 and Triton prefill kernels take no query
+offset, so the runner uses stock PyTorch SDPA with a boolean causal mask over
+all gathered keys, restricted (by SDPA's backend parameter) to its
+memory-efficient kernel, the one that accepts such a mask, with MATH as SDPA's
+stock fallback. The same kernel is used at every GPU count of the
+sequence-sharded cases (`1k`, `8k`, `128k`), 1 GPU included, so their
+per-case effective `attention_backend` is `sdpa`. Only parameters are passed
+to stock kernels; no kernel is modified or worked around.
 
 Legacy tensor-parallel mode shards Q/K/V heads and FFN intermediate weights,
 keeps full inputs on every rank, and all-reduces the output projection and FFN

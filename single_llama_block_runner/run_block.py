@@ -10,6 +10,7 @@ kernel by default, with optional FlashAttention varlen and PyTorch SDPA paths.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -718,65 +720,38 @@ def attention_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return out.permute(0, 2, 1, 3).reshape(num_seqs * seq_len, q_heads, HEAD_DIM)
 
 
-def attention_sequence_sharded(q: torch.Tensor, k: torch.Tensor,
-                               v: torch.Tensor, num_seqs: int,
-                               local_seq_len: int, full_seq_len: int,
-                               query_offset: int,
-                               backend: str) -> torch.Tensor:
-    """Causal attention for one rank's query chunk against gathered K/V.
-
-    Keys after this rank's last query position are always masked, so they are
-    dropped. What remains is ordinary causal attention aligned to the
-    bottom-right corner of the (local_q x kept_k) score matrix, which flash
-    kernels support directly (no explicit mask).
-    """
+def attention_sdpa_sequence_sharded(q: torch.Tensor, k: torch.Tensor,
+                                    v: torch.Tensor, num_seqs: int,
+                                    local_seq_len: int, full_seq_len: int,
+                                    query_offset: int) -> torch.Tensor:
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     q_heads = q.shape[1]
     kv_heads = k.shape[1]
     if q_heads % kv_heads != 0:
         raise RuntimeError(
             f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}.")
-    kept = query_offset + local_seq_len
-    k4 = k.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM)[:, :kept]
-    v4 = v.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM)[:, :kept]
 
-    if backend == "flash-attn-varlen":
-        # FA2 aligns the causal mask bottom-right when seqlen_q < seqlen_k.
-        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-
-        seq_idx = torch.arange(num_seqs + 1, device=q.device,
-                               dtype=torch.int32)
-        out = flash_attn_varlen_func(
-            q=q.contiguous(),
-            k=k4.reshape(num_seqs * kept, kv_heads, HEAD_DIM),
-            v=v4.reshape(num_seqs * kept, kv_heads, HEAD_DIM),
-            cu_seqlens_q=seq_idx * local_seq_len,
-            cu_seqlens_k=seq_idx * kept,
-            max_seqlen_q=local_seq_len,
-            max_seqlen_k=kept,
-            dropout_p=0.0,
-            softmax_scale=HEAD_DIM**-0.5,
-            causal=True,
-            fa_version=2,
-        )
-        if isinstance(out, tuple):
-            out = out[0]
-        return out
-
-    # SDPA (V100): its fused kernels need equal head counts, so expand K/V
-    # after the gather.
-    from torch.nn.attention.bias import causal_lower_right
-
-    q4 = q.contiguous().view(num_seqs, local_seq_len, q_heads,
-                             HEAD_DIM).permute(0, 2, 1, 3)
-    k4 = k4.permute(0, 2, 1, 3)
-    v4 = v4.permute(0, 2, 1, 3)
+    q4 = q.view(num_seqs, local_seq_len, q_heads, HEAD_DIM).permute(0, 2, 1, 3)
+    k4 = k.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM).permute(0, 2, 1, 3)
+    v4 = v.view(num_seqs, full_seq_len, kv_heads, HEAD_DIM).permute(0, 2, 1, 3)
     repeat = q_heads // kv_heads
     if repeat != 1:
         k4 = k4.repeat_interleave(repeat, dim=1)
         v4 = v4.repeat_interleave(repeat, dim=1)
-    out = F.scaled_dot_product_attention(
-        q4, k4.contiguous(), v4.contiguous(),
-        attn_mask=causal_lower_right(local_seq_len, kept), dropout_p=0.0)
+
+    q_pos = torch.arange(query_offset,
+                         query_offset + local_seq_len,
+                         device=q.device)[:, None]
+    k_pos = torch.arange(full_seq_len, device=q.device)[None, :]
+    attn_mask = (k_pos <= q_pos)[None, None, :, :]
+    out = F.scaled_dot_product_attention(q4,
+                                          k4,
+                                          v4,
+                                          attn_mask=attn_mask,
+                                          dropout_p=0.0,
+                                          is_causal=False)
     return out.permute(0, 2, 1, 3).reshape(num_seqs * local_seq_len, q_heads,
                                            HEAD_DIM)
 
@@ -834,10 +809,10 @@ def llama_block_forward(x: torch.Tensor, positions: torch.Tensor,
         k_full = all_gather_sequence_heads(k_r, runtime, global_num_seqs)
         v_full = all_gather_sequence_heads(v_3d, runtime, global_num_seqs)
         query_offset = runtime.rank * seq_len
-        attn_ctx = attention_sequence_sharded(q_r, k_full, v_full,
-                                              global_num_seqs, seq_len,
-                                              global_seq_len, query_offset,
-                                              backend)
+        attn_ctx = attention_sdpa_sequence_sharded(q_r, k_full, v_full,
+                                                   global_num_seqs, seq_len,
+                                                   global_seq_len,
+                                                   query_offset)
     else:
         attn_ctx = packed_attention(q_r, k_r, v_3d, b_start_loc, b_seq_len,
                                     cu_seqlens, num_seqs, seq_len,
@@ -985,16 +960,19 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
         )
 
     effective_backend = backend
-    if (args.parallel_strategy == "benchmark" and runtime.world_size > 1
-            and case.strategy == "sequence_sharded"
-            and backend == "triton-prefill"):
-        # The Triton prefill kernel has no query offset; use SDPA with a
-        # bottom-right causal mask instead.
+    # Sequence-sharded cases need an offset-aware causal mask at 4 and 8 GPUs,
+    # which only SDPA's memory-efficient kernel accepts (FlashAttention-2 and
+    # triton-prefill take no query offset). The same kernel is used at every GPU
+    # count of these cases, 1 GPU included, selected only by parameters.
+    sequence_sharded_sdpa = (args.parallel_strategy == "benchmark"
+                             and case.strategy == "sequence_sharded")
+    if sequence_sharded_sdpa:
         effective_backend = "sdpa"
+    if effective_backend != backend:
         rank0_print(
             runtime,
             f"case={case_name} strategy=sequence_sharded uses sdpa attention "
-            "(triton-prefill has no query offset).",
+            "for offset-aware causal masking after K/V gather.",
         )
 
     (x, positions, b_start_loc, b_seq_len, cu_seqlens, num_seqs, seq_len,
@@ -1007,13 +985,17 @@ def benchmark_case(case_name: str, runtime: Runtime, dtype: torch.dtype,
     local_tokens = x.shape[0]
 
     def run_once(selected_backend: str) -> torch.Tensor:
-        return llama_block_forward(x, positions, b_start_loc, b_seq_len,
-                                   cu_seqlens, cos_cache, sin_cache,
-                                   num_seqs, seq_len, local_lengths,
-                                   global_num_seqs, global_seq_len,
-                                   weights, runtime,
-                                   selected_backend, case.strategy,
-                                   args.parallel_strategy)
+        # SDPA backend choice is a parameter; MATH is SDPA's stock fallback.
+        # Other cases keep SDPA's default selection.
+        with (sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+              if sequence_sharded_sdpa else contextlib.nullcontext()):
+            return llama_block_forward(x, positions, b_start_loc, b_seq_len,
+                                       cu_seqlens, cos_cache, sin_cache,
+                                       num_seqs, seq_len, local_lengths,
+                                       global_num_seqs, global_seq_len,
+                                       weights, runtime,
+                                       selected_backend, case.strategy,
+                                       args.parallel_strategy)
 
     with torch.inference_mode():
         # Reset before the eager warmup so the peak covers the activations; the
